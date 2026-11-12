@@ -1,0 +1,4049 @@
+diff --git a/components/bsp/CMakeLists.txt b/components/bsp/CMakeLists.txt
+index 623a790..bcb761c 100644
+--- a/components/bsp/CMakeLists.txt
++++ b/components/bsp/CMakeLists.txt
+@@ -1,5 +1,13 @@
++set(srcs "bsp_sd.c" "bsp_display.c" "bsp_buttons.c" "bsp_rgb.c" "bsp_battery.c")
++if(CONFIG_BSP_SD_INTERNAL_FLASH)
++    list(APPEND srcs "bsp_sd_flash.c")
++endif()
++if(CONFIG_BSP_TOUCH_XPT2046)
++    list(APPEND srcs "bsp_touch.c")
++endif()
++
+ idf_component_register(
+-    SRCS "bsp_sd.c" "bsp_display.c" "bsp_buttons.c" "bsp_rgb.c" "bsp_battery.c"
++    SRCS ${srcs}
+     INCLUDE_DIRS "include"
+     REQUIRES esp_driver_spi esp_driver_i2c esp_lcd
+-    PRIV_REQUIRES esp_driver_gpio esp_driver_ledc esp_driver_sdspi esp_adc fatfs sdmmc vfs)
++    PRIV_REQUIRES esp_driver_gpio esp_driver_ledc esp_driver_sdspi esp_adc fatfs sdmmc vfs esp_partition wear_levelling)
+diff --git a/components/bsp/bsp_battery.c b/components/bsp/bsp_battery.c
+index 972e0b6..36b03b9 100644
+--- a/components/bsp/bsp_battery.c
++++ b/components/bsp/bsp_battery.c
+@@ -7,6 +7,18 @@
+ #include "esp_check.h"
+ #include "bsp.h"
+ 
++#if CONFIG_BSP_BOARD_DIY
++// Breadboard: powered over USB, no battery to read. Over 4.3 V reads as USB power.
++esp_err_t bsp_battery_init(void)
++{
++    return ESP_OK;
++}
++
++int bsp_battery_mv(void)
++{
++    return 5000;
++}
++#else
+ static const char *TAG = "bsp_battery";
+ 
+ static adc_oneshot_unit_handle_t s_adc;
+@@ -44,6 +56,7 @@ int bsp_battery_mv(void)
+     }
+     return sum / 8 * BOARD_BAT_DIVIDER;
+ }
++#endif
+ 
+ int bsp_battery_percent(int mv)
+ {
+diff --git a/components/bsp/bsp_bus.h b/components/bsp/bsp_bus.h
+index 6c1cc5d..b2fda4e 100644
+--- a/components/bsp/bsp_bus.h
++++ b/components/bsp/bsp_bus.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <stdbool.h>
++
+ // The LCD and the microSD card share SPI2. esp_lcd queues each flush as DMA
+ // transfers that finish after it has released the bus, and the SPI bus lock
+ // only makes a device wait for its *own* queued transfers: an SD command that
+@@ -9,3 +11,7 @@
+ // No-ops until the display has started.
+ void bsp_lcd_hold(void);
+ void bsp_lcd_release(void);
++
++// A touch reading freezes the backlight's PWM at its current level: the edges
++// spoil the conversions. No-op until the display has started.
++void bsp_backlight_freeze(bool freeze);
+diff --git a/components/bsp/bsp_buttons.c b/components/bsp/bsp_buttons.c
+index 7f92e43..6e73601 100644
+--- a/components/bsp/bsp_buttons.c
++++ b/components/bsp/bsp_buttons.c
+@@ -1,4 +1,5 @@
+-// PB1..PB6 on the TCA9534 expander (INT on GPIO25) plus the BOOT button.
++// PB1..PB6 on the TCA9534 expander (INT on GPIO25) plus the BOOT button; on a
++// breadboard build (CONFIG_BSP_BOARD_DIY), PB1..PB6 straight on GPIOs.
+ 
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+@@ -15,11 +16,66 @@ static const char *TAG = "bsp_buttons";
+ #define TCA9534_REG_CONFIG  3
+ #define POLL_MS             50
+ 
+-static i2c_master_dev_handle_t s_tca;
+-static SemaphoreHandle_t s_irq;
+ static bsp_btn_cb_t s_cb;
+ static volatile uint32_t s_pressed;
+ 
++#if CONFIG_BSP_BOARD_DIY
++// Each button pulls its GPIO to GND. Polled; a change counts once two reads
++// POLL_MS apart agree (debounce).
++#define DIY_POLL_MS 15
++
++static const int s_gpios[BOARD_BTN_COUNT] = BOARD_BTN_GPIOS;
++
++static uint32_t read_gpios(void)
++{
++    uint32_t pressed = 0;
++    for (int i = 0; i < BOARD_BTN_COUNT; i++) {
++        if (!gpio_get_level(s_gpios[i])) {
++            pressed |= 1u << i;
++        }
++    }
++    if (!gpio_get_level(BOARD_BOOT_BTN)) {
++        pressed |= BSP_BTN_BOOT;
++    }
++    return pressed;
++}
++
++static void diy_task(void *arg)
++{
++    uint32_t last = s_pressed;
++    for (;;) {
++        vTaskDelay(pdMS_TO_TICKS(DIY_POLL_MS));
++        uint32_t now = read_gpios();
++        if (now == last && now != s_pressed) {
++            uint32_t changed = now ^ s_pressed;
++            s_pressed = now;
++            if (s_cb) {
++                s_cb(now, changed);
++            }
++        }
++        last = now;
++    }
++}
++
++esp_err_t bsp_buttons_start(bsp_btn_cb_t cb)
++{
++    s_cb = cb;
++    uint64_t mask = BIT64(BOARD_BOOT_BTN);
++    for (int i = 0; i < BOARD_BTN_COUNT; i++) {
++        mask |= BIT64(s_gpios[i]);
++    }
++    gpio_config_t io = { .pin_bit_mask = mask, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE };
++    ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "gpio");
++    vTaskDelay(pdMS_TO_TICKS(2));           // let the pull-ups settle
++    s_pressed = read_gpios();
++    xTaskCreate(diy_task, "buttons", 2048, NULL, 5, NULL);
++    return ESP_OK;
++}
++
++#else
++static i2c_master_dev_handle_t s_tca;
++static SemaphoreHandle_t s_irq;
++
+ static void IRAM_ATTR tca_isr(void *arg)
+ {
+     BaseType_t woken = pdFALSE;
+@@ -94,6 +150,8 @@ esp_err_t bsp_buttons_start(bsp_btn_cb_t cb)
+     return ESP_OK;
+ }
+ 
++#endif
++
+ uint32_t bsp_buttons_get(void)
+ {
+     return s_pressed;
+diff --git a/components/bsp/bsp_display.c b/components/bsp/bsp_display.c
+index 326b83c..f2c6648 100644
+--- a/components/bsp/bsp_display.c
++++ b/components/bsp/bsp_display.c
+@@ -52,7 +52,7 @@ static bool flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data
+ #define BL_TIMER    LEDC_TIMER_0
+ #define BL_CHANNEL  LEDC_CHANNEL_0
+ #define BL_BITS     LEDC_TIMER_10_BIT
+-#define BL_MAX      ((1u << 10) - 1)
++#define BL_MAX      (1u << 10)      // full duty: steady on, no edges
+ 
+ static uint8_t s_bl_pct = 100;  // the level "on" means
+ static bool s_bl_on;
+@@ -106,6 +106,13 @@ uint8_t bsp_backlight_get_level(void)
+     return s_bl_pct;
+ }
+ 
++void bsp_backlight_freeze(bool freeze)
++{
++    if (s_bl_ready) {
++        (freeze ? ledc_timer_pause : ledc_timer_resume)(BL_MODE, BL_TIMER);
++    }
++}
++
+ lv_display_t *bsp_display_start(void)
+ {
+     bl_init();
+diff --git a/components/bsp/bsp_sd.c b/components/bsp/bsp_sd.c
+index 28e1b22..eefd317 100644
+--- a/components/bsp/bsp_sd.c
++++ b/components/bsp/bsp_sd.c
+@@ -41,6 +41,7 @@
+ 
+ static const char *TAG = "bsp_sd";
+ 
++#if !CONFIG_BSP_SD_INTERNAL_FLASH
+ static SemaphoreHandle_t s_lock;        // recursive: format re-enters mount
+ static spi_device_handle_t s_raw;       // raw access with manual CS, for probing and parking
+ static sdmmc_card_t *s_card;
+@@ -50,6 +51,7 @@ static uint64_t s_total_bytes, s_free_bytes;
+ 
+ #define LOCK()   xSemaphoreTakeRecursive(s_lock, portMAX_DELAY)
+ #define UNLOCK() xSemaphoreGiveRecursive(s_lock)
++#endif
+ 
+ esp_err_t bsp_spi_bus_init(void)
+ {
+@@ -57,6 +59,24 @@ esp_err_t bsp_spi_bus_init(void)
+     if (s_done) {
+         return ESP_OK;
+     }
++#if CONFIG_BSP_SD_INTERNAL_FLASH
++    // No card on the bus (bsp_sd_flash.c): deselect the LCD, and the touch
++    // controller if there is one.
++    gpio_config_t cs = {
++#if CONFIG_BSP_TOUCH_XPT2046
++        .pin_bit_mask = BIT64(BOARD_LCD_CS) | BIT64(BOARD_TOUCH_CS),
++#else
++        .pin_bit_mask = BIT64(BOARD_LCD_CS),
++#endif
++        .mode = GPIO_MODE_OUTPUT,
++        .pull_up_en = GPIO_PULLUP_ENABLE,
++    };
++    ESP_RETURN_ON_ERROR(gpio_config(&cs), TAG, "cs gpio");
++    gpio_set_level(BOARD_LCD_CS, 1);
++#if CONFIG_BSP_TOUCH_XPT2046
++    gpio_set_level(BOARD_TOUCH_CS, 1);
++#endif
++#else
+     // Deselect both devices before the first clock edge on the bus.
+     gpio_config_t cs = {
+         .pin_bit_mask = BIT64(BOARD_LCD_CS) | BIT64(BOARD_SD_CS),
+@@ -66,6 +86,7 @@ esp_err_t bsp_spi_bus_init(void)
+     ESP_RETURN_ON_ERROR(gpio_config(&cs), TAG, "cs gpio");
+     gpio_set_level(BOARD_LCD_CS, 1);
+     gpio_set_level(BOARD_SD_CS, 1);
++#endif
+ 
+     spi_bus_config_t bus = {
+         .sclk_io_num = BOARD_SPI_SCK,
+@@ -78,6 +99,7 @@ esp_err_t bsp_spi_bus_init(void)
+     ESP_RETURN_ON_ERROR(spi_bus_initialize(BOARD_SPI_HOST, &bus, SPI_DMA_CH_AUTO), TAG, "spi bus");
+     gpio_set_pull_mode(BOARD_SPI_MISO, GPIO_PULLUP_ONLY);
+ 
++#if !CONFIG_BSP_SD_INTERNAL_FLASH
+     spi_device_interface_config_t raw_cfg = {
+         .clock_speed_hz = 400 * 1000,
+         .mode = 0,
+@@ -86,10 +108,12 @@ esp_err_t bsp_spi_bus_init(void)
+     };
+     ESP_RETURN_ON_ERROR(spi_bus_add_device(BOARD_SPI_HOST, &raw_cfg, &s_raw), TAG, "raw sd device");
+     s_lock = xSemaphoreCreateRecursiveMutex();
++#endif
+     s_done = true;
+     return ESP_OK;
+ }
+ 
++#if !CONFIG_BSP_SD_INTERNAL_FLASH
+ // ---------------------------------------------------------------------------
+ // Raw SPI-mode commands with manual CS (only used while sdspi is idle).
+ 
+@@ -351,6 +375,7 @@ void bsp_sd_print_card(void)
+     }
+     UNLOCK();
+ }
++#endif  // !CONFIG_BSP_SD_INTERNAL_FLASH
+ 
+ const char *bsp_sd_state_str(bsp_sd_state_t s)
+ {
+diff --git a/components/bsp/include/board.h b/components/bsp/include/board.h
+index 0b6d98e..3c4e55c 100644
+--- a/components/bsp/include/board.h
++++ b/components/bsp/include/board.h
+@@ -4,9 +4,16 @@
+ // Recovered from the stock "c5_badge_hw_test" firmware (logs + disassembly) and
+ // confirmed by probing the board. See ../README.md for how each pin was verified.
+ 
++#include "sdkconfig.h"
+ #include "driver/spi_common.h"
+ #include "driver/i2c_types.h"
+ 
++#if CONFIG_BSP_BOARD_DIY
++#define BOARD_NAME              "breadboard (buttons on GPIO, no battery)"
++#else
++#define BOARD_NAME              "badge"
++#endif
++
+ // Shared SPI bus (LCD + microSD). The SD card must be switched into SPI mode
+ // before any LCD traffic runs on this bus - see bsp_sd.c.
+ #define BOARD_SPI_HOST          SPI2_HOST
+@@ -15,7 +22,11 @@
+ #define BOARD_SPI_MISO          8
+ 
+ // ILI9341 320x240 TFT (landscape)
++#if CONFIG_BSP_BOARD_DIY
++#define BOARD_LCD_CS            1       // breadboard: GPIO6 is left free
++#else
+ #define BOARD_LCD_CS            6
++#endif
+ #define BOARD_LCD_DC            7
+ #define BOARD_LCD_RST           0       // as used by stock firmware
+ #define BOARD_LCD_BL            3       // active high, external pull-down
+@@ -24,8 +35,33 @@
+ #define BOARD_LCD_PCLK_HZ       (20 * 1000 * 1000)
+ 
+ // microSD (SPI mode, no card-detect or write-protect lines)
++#if CONFIG_BSP_SD_INTERNAL_FLASH
++#define BOARD_SD_CS             (-1)    // no card: /sdcard is in the internal flash
++#else
+ #define BOARD_SD_CS             4
++#endif
++
++#if CONFIG_BSP_TOUCH_XPT2046
++// XPT2046 touch on the shared bus (T_CLK/T_DIN/T_DO on SCK/MOSI/MISO)
++#define BOARD_TOUCH_CS          CONFIG_BSP_TOUCH_CS
++#define BOARD_TOUCH_IRQ         CONFIG_BSP_TOUCH_IRQ    // -1: polled
++#if BOARD_TOUCH_CS == BOARD_LCD_CS || BOARD_TOUCH_CS == BOARD_SD_CS || \
++    (BOARD_TOUCH_IRQ >= 0 && (BOARD_TOUCH_IRQ == BOARD_SD_CS || BOARD_TOUCH_IRQ == BOARD_TOUCH_CS))
++#error "touch CS / IRQ pin clashes with the LCD or microSD CS"
++#endif
++#endif
+ 
++#if CONFIG_BSP_BOARD_DIY
++// Breadboard: PB1..PB6 = Up, Left, Right, Down, Select, Back, each a button from
++// the GPIO to GND (internal pull-up, active low). No expander: -1 = none.
++#define BOARD_BTN_GPIOS         {2, 5, 23, 24, 25, 26}
++#define BOARD_I2C_PORT          I2C_NUM_0
++#define BOARD_I2C_SCL           (-1)
++#define BOARD_I2C_SDA           (-1)
++#define BOARD_TCA9534_ADDR      0
++#define BOARD_TCA9534_INT       (-1)
++#define BOARD_BTN_COUNT         6
++#else
+ // I2C: TCA9534 I/O expander, P0..P5 = PB1..PB6 (active low), P6/P7 unconnected
+ #define BOARD_I2C_PORT          I2C_NUM_0
+ #define BOARD_I2C_SCL           23
+@@ -33,6 +69,7 @@
+ #define BOARD_TCA9534_ADDR      0x20
+ #define BOARD_TCA9534_INT       25      // open-drain, active low
+ #define BOARD_BTN_COUNT         6
++#endif
+ 
+ // BOOT button (strapping pin, external pull-up, active low)
+ #define BOARD_BOOT_BTN          28
+@@ -41,9 +78,14 @@
+ #define BOARD_RGB_GPIO          27
+ #define BOARD_RGB_COUNT         8
+ 
+-// Battery sense: ADC1 on GPIO1 through a 1:1 divider
++// Battery sense: ADC1 on GPIO1 through a 1:1 divider (breadboard: no battery, -1)
++#if CONFIG_BSP_BOARD_DIY
++#define BOARD_BAT_ADC_GPIO      (-1)
++#define BOARD_BAT_DIVIDER       0
++#else
+ #define BOARD_BAT_ADC_GPIO      1
+ #define BOARD_BAT_DIVIDER       2
++#endif
+ 
+ // UART0 console via CH340C
+ #define BOARD_UART_TX           11
+diff --git a/components/bsp/include/bsp.h b/components/bsp/include/bsp.h
+index f503531..066a89f 100644
+--- a/components/bsp/include/bsp.h
++++ b/components/bsp/include/bsp.h
+@@ -54,6 +54,19 @@ typedef void (*bsp_btn_cb_t)(uint32_t pressed, uint32_t changed);
+ esp_err_t bsp_buttons_start(bsp_btn_cb_t cb);
+ uint32_t bsp_buttons_get(void);
+ 
++// ---- Touch panel (XPT2046, CONFIG_BSP_TOUCH_XPT2046) ----
++// Raw readings, 0..4095 on each axis; z is the pressure (z1 + 4095 - z2).
++typedef enum { BSP_TOUCH_PRESS, BSP_TOUCH_MOVE, BSP_TOUCH_RELEASE } bsp_touch_ev_t;
++typedef void (*bsp_touch_cb_t)(bsp_touch_ev_t ev, uint16_t x, uint16_t y);    // on the touch task
++typedef struct {
++    uint16_t x, y, z1, z2, z;
++    bool down;          // pressed hard enough
++    bool ok;            // and steady
++} bsp_touch_raw_t;
++esp_err_t bsp_touch_start(bsp_touch_cb_t cb, uint16_t z_min);   // ESP_ERR_NOT_FOUND: no chip
++bool bsp_touch_raw(bsp_touch_raw_t *out);                      // a fresh reading; false: not started
++void bsp_touch_set_threshold(uint16_t z_min);
++
+ // ---- RGB LEDs ----
+ esp_err_t bsp_rgb_init(void);
+ void bsp_rgb_set(int index, uint8_t r, uint8_t g, uint8_t b);
+diff --git a/docs/LUA_API.md b/docs/LUA_API.md
+index fdab64d..8ab4c10 100644
+--- a/docs/LUA_API.md
++++ b/docs/LUA_API.md
+@@ -73,9 +73,11 @@ The manifest, as the badge stores it:
+   "author": "@toly",
+   "summary": "Eat, grow, don't bite yourself.",
+   "icon": "play",                   // one of the icon names below
++  "icon_image": "icon.png",         // optional: a PNG or JPEG in files/, shown instead of the icon
+   "accent": "14F195",               // hex colour, no '#'
+   "category": "games",              // games | tools | social | quests | demos
+   "permissions": ["lamps", "items", "http"],  // led wifi mesh ble lamps items profile quest http rpc
++                                             // wallet chain ipfs (this fork)
+   "hosts": ["api.example.com"],     // what `http` and `ws` may call (only with the `http` permission)
+   "files": 2,                       // bundled files (the store fills it in)
+   "filesSize": 5120,                // their bytes together
+@@ -91,6 +93,8 @@ The manifest, as the badge stores it:
+ Icons: `play`, `star`, `heart`, `bell`, `gift`, `home`, `image`, `list`, `wifi`,
+ `shuffle`, `eye`, `edit`, `charge`, `gps`, `settings`, `audio`, `bulb` (the badge maps
+ them to LVGL symbols; the web to matching glyphs).
++`icon_image` is a bundled file's path; the Apps list shows it 32 x 32, cropped square
++from the middle, transparency on black. Missing or unreadable, the icon shows instead.
+ 
+ ## Lifecycle
+ 
+@@ -109,6 +113,9 @@ function on_meet(from, data) -- another badge asks for a signed meet (needs "mes
+ end                          -- return a table to sign it ("Meets")
+ function on_exit()           -- the app is closing (HOME, CANCEL, sys.exit, error)
+ end
++function on_touch(x, y)      -- a tap nothing on screen took, in app coordinates (touch builds):
++  return true                -- handled; false/nil: it's SELECT
++end
+ ```
+ 
+ Up, down, left, right and CANCEL auto-repeat while held (`rep` true: after 400 ms, then
+@@ -232,6 +239,7 @@ bundled with the app, play animated GIFs, write pixel art in Lua, or draw on a c
+ 
+ ```lua
+ local logo = ui.image(10, 10, "art/logo.png")         -- a bundled PNG, shown as it is
++local photo = ui.image(10, 80, "photo.jpg", {size = 48})   -- a PNG or JPEG of any size, 48 x 48
+ local hero = ui.image(100, 60, {                      -- pixel art: one character per pixel
+   "..pp..",
+   ".pggp.",
+@@ -266,6 +274,9 @@ dance:scale(3)  dance:pos(x, y)  dance:show(b)  dance:remove()
+   gives its first frame), or a table of rows. A path is read and decoded each time it's given, so load what you draw
+   often with `ui.load` once. The `{palette = ...}` option, after the position, goes
+   with rows.
++- **Photos.** With `size`, a bundled PNG or JPEG (baseline, not progressive) of any size
++  becomes its middle square shrunk to `size` × `size`, transparency on black. It's made
++  the first time and kept on the card, so showing it again is quick.
+ - **Pixel art.** Each character is a pixel: `.` and space are see-through, `#` is the
+   theme's text colour, and `k` black, `w` white, `p` purple, `g` green, `m` pink,
+   `v` light purple, `b` blue, `a` aqua, `l` lime, `y` yellow, `o` orange are the
+@@ -1732,6 +1743,72 @@ Bun.serve({
+   `solana:<recipient>?amount=0.01&reference=<address>&label=Badge`, has the wallet
+   build the transfer itself. Watch for the reference in the same way.
+ 
++### `sol`, `wallet`, `chain`, `ipfs` (permissions `wallet`, `chain`, `ipfs`; this fork)
++
++The badge's own wallet: one keypair in NVS that apps never see, transactions built and
++signed on the badge, and Solana's JSON-RPC and IPFS uploads straight from it, without the
++badge server. NVS is plain flash, so keep only what you'd be fine losing in it. The
++console sets it up:
++
++```
++wallet new [force] | import <secret> | export yes | forget yes
++wallet rpc [<https url> | devnet | mainnet]      -- chain.rpc's RPC; devnet by default
++wallet ipfs [key <token> | url <url> | off]      -- ipfs.add's key and endpoint (Filebase by default)
++wallet mint [import <secret> | off]              -- a mint keypair for the next launch
++```
++
++`sol` needs no permission. Addresses are base58 strings; seeds, instruction data and
++messages are binary strings (`string.pack` builds them). Numbers past 2^31 are decimal
++strings.
++
++```lua
++sol.encode(bytes)                 -- base58, up to 64 bytes
++sol.decode(address [, n])         -- its n bytes (default 32), or nil
++sol.pda({seed, ...}, program)     -- address, bump; up to 16 seeds of up to 32 bytes
++sol.ata(owner, mint, token_program)
++sol.u64(n)                        -- 8 bytes little-endian; n an integer or a decimal string
++local msg = sol.message{
++  payer = address,
++  blockhash = base58,
++  instructions = {{program = address, accounts = {{address, signer, writable}, ...}, data = bytes}, ...},
++  budget = {cu_limit = 200000, priority_fee = 5000, loaded_data = bytes},   -- optional
++}
++```
++
++`sol.message` compiles the keys as Solana does (payer first, then signers and writable
++accounts) and returns the message, binary: a legacy one (up to 1232 bytes), or with
++`budget` a v1 one (SIMD-0385, up to 4096 bytes) that carries its compute budget itself:
++`cu_limit` (required), `priority_fee` in lamports for the whole transaction, and
++`loaded_data` (default 64 MB). Up to 6 instructions, 24 accounts and 400 data bytes each.
++
++```lua
++wallet.address()                  -- base58, or nil with no wallet
++wallet.keypair()                  -- address of a new throwaway keypair (a mint), gone when the app stops
++wallet.mint()                     -- address of the console's `wallet mint import`, or nil
++wallet.mint_used(address)         -- erase that imported mint once it made its coin; true if it was it
++wallet.sign(msg, prompt, function(ok, r) end)   -- r = {signature = base58, tx = base64} or why not
++```
++
++`wallet.sign` asks the owner in the OS's own dialog, showing the app, the cluster, `prompt`
++(up to 100 characters) and the fee payer; the script can't answer it. It signs with the
++wallet and this run's keypairs (`wallet.keypair`, `wallet.mint`, up to 4), whichever the
++message names as signers, and hands back the wire transaction to send.
++
++```lua
++chain.cluster()                   -- "devnet" | "mainnet" | "testnet" | "custom", from the RPC URL
++chain.rpc(method, params, function(ok, result) end)
++chain.rpc(method, params, {url = "https://..."}, function(ok, result) end)   -- another endpoint
++ipfs.ready()                      -- true when an upload key is set
++ipfs.add("images/coin.png", function(ok, cid) end)                   -- a bundled file, up to 2 MB
++ipfs.add({name = "metadata.json", data = text}, function(ok, cid) end)   -- up to 4 KB of text
++```
++
++`chain.rpc` posts the JSON-RPC call to the RPC set with `wallet rpc`, or to `url` (https,
++up to 200 characters: a Jito block engine, say), over Wi-Fi. `result` is the call's
++`result`, decoded, with integers past 32 bits as strings; an RPC error comes back as
++`ok` false and `"rpc <code>: <message>"`. Answers are up to 8 KB: ask for what fits
++(`dataSlice`, `limit`). `ipfs.add` uploads with the console's key, which Lua never sees.
++
+ ## Example
+ 
+ ```lua
+@@ -1870,6 +1947,6 @@ bundled path like `lib/quiz.lua`:
+   there. Run on badge works this way.
+ 
+ These refuse while the app runs (`open home` closes it) and check `app.json` like an
+-install does. Writing or removing any file of an app deletes its compiled code from
+-the store (`code.bin`): from then on it runs from its source until the store installs
+-it again.
++install does. Writing or removing an app's `app.json` or a `.lua` file deletes its
++compiled code from the store (`code.bin`): from then on it runs from its source until
++the store installs it again.
+diff --git a/emulator/platform/app_main_emu.c b/emulator/platform/app_main_emu.c
+index 9ab2109..1b41fad 100644
+--- a/emulator/platform/app_main_emu.c
++++ b/emulator/platform/app_main_emu.c
+@@ -9,6 +9,8 @@
+ #include "esp_log.h"
+ #include "nvs_flash.h"
+ #include "bsp.h"
++#include "wallet/wallet.h"
++#include "kb/kb_cmd.h"
+ #include "core/os.h"
+ #include "core/os_wifi.h"
+ #include "core/os_cloud.h"
+@@ -112,5 +114,7 @@ void app_main(void)
+ 
+     os_start();
+     os_ota_init();
++    wallet_init();      // the badge wallet's console (wallet/wallet.h)
++    kb_cmd_init();      // type into the on-screen keyboard from a PC (kb/kb_cmd.h)
+     console_start();    // last: the device console only sees commands registered before it
+ }
+diff --git a/emulator/platform/os_http_emu.c b/emulator/platform/os_http_emu.c
+index c2fd2d4..9997850 100644
+--- a/emulator/platform/os_http_emu.c
++++ b/emulator/platform/os_http_emu.c
+@@ -8,6 +8,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ #include <emscripten.h>
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+@@ -145,6 +146,66 @@ esp_err_t os_http_download(const char *url, const char *bearer, const char *path
+     return err;
+ }
+ 
++// Uploads: the bytes go to fetch() as a FormData part; the answer as a request's.
++// (Sent once: an upload over 30 s gives up.)
++EM_JS(int, http_js_upload, (const char *url, const char *bearer, const uint8_t *data, int len, const char *name), {
++    const id = (Module.httpNext = (Module.httpNext || 0) + 1);
++    const req = { done: false, status: 0, text: "", failed: false };
++    (Module.http = Module.http || new Map()).set(id, req);
++    const form = new FormData();
++    form.append("file", new Blob([HEAPU8.slice(data, data + len)], { type: "application/octet-stream" }),
++                UTF8ToString(name));
++    const headers = {};
++    if (bearer) headers["Authorization"] = "Bearer " + UTF8ToString(bearer);
++    const opts = { method: "POST", headers, body: form, credentials: "omit", cache: "no-store" };
++    if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) opts.signal = AbortSignal.timeout(30000);
++    fetch(UTF8ToString(url), opts)
++        .then((r) => r.text().then((t) => { req.status = r.status; req.text = t; req.done = true; }))
++        .catch(() => { req.failed = true; req.done = true; });
++    return id;
++});
++
++esp_err_t os_http_upload(const char *url, const char *bearer, const char *path, const void *data, size_t len,
++                         const char *filename, char *resp, size_t cap, int *status)
++{
++    *status = 0;
++    if (cap) {
++        resp[0] = 0;
++    }
++    uint8_t *buf = NULL;
++    if (path) {
++        struct stat st;
++        FILE *f = stat(path, &st) == 0 && S_ISREG(st.st_mode) ? fopen(path, "rb") : NULL;
++        if (!f) {
++            return ESP_ERR_NOT_FOUND;
++        }
++        len = st.st_size;
++        buf = len <= OS_HTTP_UPLOAD_MAX ? malloc(len ? len : 1) : NULL;
++        bool ok = buf && fread(buf, 1, len, f) == len;
++        fclose(f);
++        if (!ok) {
++            free(buf);
++            return len > OS_HTTP_UPLOAD_MAX ? ESP_ERR_INVALID_SIZE : ESP_FAIL;
++        }
++        data = buf;
++    }
++    if (len > OS_HTTP_UPLOAD_MAX) {
++        return ESP_ERR_INVALID_SIZE;
++    }
++    s_requests++;
++    int id = http_js_upload(url, bearer, data, (int)len, filename);
++    free(buf);                          // the Blob holds its own copy
++    int rc;
++    while ((rc = http_js_poll(id, resp, (int)cap, status)) == 0) {
++        vTaskDelay(pdMS_TO_TICKS(20));
++    }
++    if (rc < 0) {
++        ESP_LOGW(TAG, "upload to %s failed", url);
++        return ESP_FAIL;
++    }
++    return ESP_OK;
++}
++
+ // The browser keeps its own connections alive: nothing to manage here.
+ 
+ void os_http_tick(void)
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index d6a2af4..7671a59 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -4,7 +4,12 @@ idf_component_register(
+     SRCS ${SOLANA_OS_SRCS} ${SOLANA_OS_DEVICE_SRCS}
+     INCLUDE_DIRS "."
+     PRIV_REQUIRES bsp nvs_flash esp_wifi esp_netif esp_event console esp_timer mbedtls
+-                  esp_app_format app_update esp_partition spi_flash fatfs vfs esp_http_client esp-tls tcp_transport lwip esp_driver_uart bt)
++                  esp_app_format app_update esp_partition spi_flash fatfs vfs esp_http_client esp-tls tcp_transport lwip esp_driver_uart bt
++                  esp_driver_usb_serial_jtag)
+ 
+ # cJSON (espressif/cjson) parses mesh JSON with a depth cap of 16:
+ # CONFIG_CJSON_NESTING_LIMIT in sdkconfig.defaults.
++
++# TweetNaCl (sol/vendor, public domain) fills 16-byte constants from 16-character
++# strings on purpose ("expand 32-byte k"): no NUL wanted. GCC 14+ flags it.
++set_source_files_properties(sol/vendor/tweetnacl.c PROPERTIES COMPILE_OPTIONS "-Wno-unterminated-string-initialization")
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index 343aff6..cd270f6 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -17,4 +17,10 @@ menu "Solana OS"
+             Channel badges park on for ESP-NOW (docs/MESH.md) until the
+             server's hello says otherwise (MESH_CHANNEL on the server).
+ 
++    config OS_TOUCH
++        bool
++        help
++            Touch input (core/os_touch.c): on when the board has a touch
++            panel (BSP_TOUCH_XPT2046 selects it).
++
+ endmenu
+diff --git a/main/app_main.c b/main/app_main.c
+index 3c5bf4d..0b97b03 100644
+--- a/main/app_main.c
++++ b/main/app_main.c
+@@ -6,6 +6,8 @@
+ #include "esp_log.h"
+ #include "nvs_flash.h"
+ #include "bsp.h"
++#include "wallet/wallet.h"
++#include "kb/kb_cmd.h"
+ #include "core/os.h"
+ #include "core/os_wifi.h"
+ #include "core/os_cloud.h"
+@@ -75,5 +77,7 @@ void app_main(void)
+ 
+     os_start();
+     os_ota_init();
++    wallet_init();      // the badge wallet's console (wallet/wallet.h)
++    kb_cmd_init();      // type into the on-screen keyboard from a PC (kb/kb_cmd.h)
+     console_start();    // last: the device console only sees commands registered before it
+ }
+diff --git a/main/apps/apps/apps_app.c b/main/apps/apps/apps_app.c
+index 82deb56..91b18fc 100644
+--- a/main/apps/apps/apps_app.c
++++ b/main/apps/apps/apps_app.c
+@@ -24,6 +24,7 @@
+ 
+ #define APPS_MAX        40
+ #define REMOVE_WAIT_MS  3000
++#define ICON_SLOTS      8       // at least the rows on screen
+ 
+ typedef enum { V_LIST, V_INFO } view_t;
+ 
+@@ -43,6 +44,13 @@ static int64_t s_rm_until;
+ static void *s_lib_req;                 // library request in flight (os_api ctx), NULL = none
+ static bool s_lib_done;                 // expiry times refreshed this visit
+ 
++static struct {
++    int index;
++    uint32_t used;                      // 0 = free
++    lv_draw_buf_t *buf;
++} s_icons[ICON_SLOTS];                  // picture icons of the rows, least recently used goes
++static uint32_t s_icon_clock;
++
+ static int64_t now_ms(void)
+ {
+     return xTaskGetTickCount() * portTICK_PERIOD_MS;
+@@ -58,6 +66,11 @@ static void worker(void *arg)
+     }
+     lua_pkg_t *pkgs = malloc(APPS_MAX * sizeof(*pkgs));
+     int n = pkgs ? lua_pkg_scan(pkgs, APPS_MAX) : 0;
++    for (int i = 0; i < n; i++) {
++        if (pkgs[i].icon_image[0] && lua_pkg_thumb(pkgs[i].id, pkgs[i].icon_image, UI_ROW_ICON, NULL)) {
++            pkgs[i].icon_image[0] = 0;      // the symbol shows instead
++        }
++    }
+     xSemaphoreTake(s_mx, portMAX_DELAY);
+     if (s_open) {
+         free(s_inbox);
+@@ -77,7 +90,7 @@ static void start_worker(const char *remove_id)
+     bool busy = s_busy;
+     if (!busy) {
+         strlcpy(s_job_rm, remove_id ? remove_id : "", sizeof(s_job_rm));
+-        s_busy = xTaskCreate(worker, "apps_scan", 4096, NULL, 3, NULL) == pdPASS;
++        s_busy = xTaskCreate(worker, "apps_scan", 6144, NULL, 3, NULL) == pdPASS;
+     }
+     xSemaphoreGive(s_mx);
+     if (busy) {
+@@ -105,10 +118,58 @@ static void time_left(const lua_pkg_t *p, char *out, size_t n)
+     }
+ }
+ 
++// The app's picture icon, for the caller to destroy; NULL: none.
++static lv_draw_buf_t *icon_load(const lua_pkg_t *p)
++{
++    lv_draw_buf_t *buf = p->icon_image[0]
++        ? lv_draw_buf_create(UI_ROW_ICON, UI_ROW_ICON, LV_COLOR_FORMAT_RGB565, UI_ROW_ICON * 2) : NULL;
++    if (buf && lua_pkg_thumb(p->id, p->icon_image, UI_ROW_ICON, (uint16_t *)buf->data)) {
++        lv_draw_buf_destroy(buf);
++        buf = NULL;
++    }
++    return buf;
++}
++
++static void icons_free(void)
++{
++    for (int k = 0; k < ICON_SLOTS; k++) {
++        if (s_icons[k].buf) {
++            lv_draw_buf_destroy(s_icons[k].buf);
++        }
++        s_icons[k].buf = NULL;
++        s_icons[k].used = 0;
++    }
++}
++
++static const void *icon(int i)
++{
++    int old = 0;
++    for (int k = 0; k < ICON_SLOTS; k++) {
++        if (s_icons[k].used && s_icons[k].index == i) {
++            s_icons[k].used = ++s_icon_clock;
++            return s_icons[k].buf;
++        }
++        old = s_icons[k].used < s_icons[old].used ? k : old;
++    }
++    lv_draw_buf_t *buf = icon_load(&s_pkgs[i]);
++    if (!buf) {
++        s_pkgs[i].icon_image[0] = 0;
++        return NULL;
++    }
++    if (s_icons[old].buf) {
++        lv_draw_buf_destroy(s_icons[old].buf);
++    }
++    s_icons[old].index = i;
++    s_icons[old].used = ++s_icon_clock;
++    s_icons[old].buf = buf;
++    return buf;
++}
++
+ static void row(int i, ui_row_t *r, void *ctx)
+ {
+     const lua_pkg_t *p = &s_pkgs[i];
+-    snprintf(r->title, sizeof(r->title), "%s  %s", p->symbol, p->name);
++    r->icon = p->icon_image[0] ? icon(i) : NULL;
++    snprintf(r->title, sizeof(r->title), "%s%s%s", r->icon ? "" : p->symbol, r->icon ? "" : "  ", p->name);
+     if (p->temp) {
+         time_left(p, r->sub, sizeof(r->sub));
+         strlcpy(r->right, "Quest", sizeof(r->right));
+@@ -171,6 +232,11 @@ static void refresh_library(void)
+ // ---------------------------------------------------------------------------
+ // Info
+ 
++static void icon_deleted(lv_event_t *e)
++{
++    lv_draw_buf_destroy(lv_event_get_user_data(e));
++}
++
+ static void show_info(const lua_pkg_t *p)
+ {
+     s_view = V_INFO;
+@@ -184,8 +250,21 @@ static void show_info(const lua_pkg_t *p)
+     lv_obj_set_scrollbar_mode(s_info, LV_SCROLLBAR_MODE_AUTO);
+ 
+     char line[96];
+-    snprintf(line, sizeof(line), "%s  %s", p->symbol, p->name);
+-    ui_label(s_info, &sol_font_20, COL_TEXT, line);
++    lv_obj_t *head = s_info;
++    lv_draw_buf_t *buf = icon_load(p);
++    if (buf) {
++        head = lv_obj_create(s_info);
++        lv_obj_remove_style_all(head);
++        lv_obj_set_size(head, lv_pct(100), LV_SIZE_CONTENT);
++        lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
++        lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
++        lv_obj_set_style_pad_column(head, 8, 0);
++        lv_obj_t *img = lv_image_create(head);
++        lv_obj_add_event_cb(img, icon_deleted, LV_EVENT_DELETE, buf);
++        lv_image_set_src(img, buf);
++    }
++    snprintf(line, sizeof(line), "%s%s%s", buf ? "" : p->symbol, buf ? "" : "  ", p->name);
++    ui_label(head, &sol_font_20, COL_TEXT, line);
+     char cat[8];
+     strlcpy(cat, p->category, sizeof(cat));
+     cat[0] = cat[0] >= 'a' && cat[0] <= 'z' ? cat[0] - 'a' + 'A' : cat[0];     // "games" -> "Games"
+@@ -267,6 +346,7 @@ static void leave(void)
+     free(s_inbox);
+     s_inbox = NULL;
+     xSemaphoreGive(s_mx);
++    icons_free();
+     free(s_pkgs);
+     s_pkgs = NULL;
+     s_n = -2;
+@@ -281,6 +361,7 @@ static void tick(void)
+     xSemaphoreGive(s_mx);
+     if (in) {
+         int sel = ui_list_selected(s_list);
++        icons_free();
+         free(s_pkgs);
+         s_pkgs = in;
+         s_n = n;
+diff --git a/main/apps/debug/debug_app.c b/main/apps/debug/debug_app.c
+index 0b59417..41aa546 100644
+--- a/main/apps/debug/debug_app.c
++++ b/main/apps/debug/debug_app.c
+@@ -300,7 +300,11 @@ static void sd_render_info(void)
+ static void build_sd(lv_obj_t *p)
+ {
+     lv_obj_t *box = ui_panel(p, 4, 4, OS_ROOT_W - 8, 66);
++#if CONFIG_BSP_SD_INTERNAL_FLASH
++    lv_obj_t *t = ui_label(box, &sol_mono_12, COL_DIM, LV_SYMBOL_SD_CARD " Internal flash  FAT  no microSD");
++#else
+     lv_obj_t *t = ui_label(box, &sol_mono_12, COL_DIM, LV_SYMBOL_SD_CARD " microSD  SPI2  CS=GPIO4");
++#endif
+     lv_obj_set_pos(t, 0, -2);
+     s_sd_status = ui_label(box, &sol_font_14, COL_TEXT, "");
+     lv_obj_align(s_sd_status, LV_ALIGN_TOP_RIGHT, 0, -4);
+diff --git a/main/core/console.c b/main/core/console.c
+index 10abf9a..02436c9 100644
+--- a/main/core/console.c
++++ b/main/core/console.c
+@@ -12,6 +12,10 @@
+ #include "freertos/task.h"
+ #include "esp_console.h"
+ #include "driver/uart.h"
++#if CONFIG_BSP_BOARD_DIY
++#include "driver/usb_serial_jtag.h"
++#include "driver/usb_serial_jtag_vfs.h"
++#endif
+ #include "esp_timer.h"
+ #include "esp_heap_caps.h"
+ #include "esp_log.h"
+@@ -31,11 +35,12 @@ static int cmd_heap(int argc, char **argv);
+ 
+ static int cmd_info(int argc, char **argv)
+ {
+-    printf("Solana OS %s\nBoard: ESP32-C5 badge\n"
++    printf("Solana OS %s\nBoard: ESP32-C5 %s\n"
+            "  SPI2 SCK=%d MOSI=%d MISO=%d | LCD CS=%d DC=%d RST=%d BL=%d | SD CS=%d\n"
+            "  I2C SCL=%d SDA=%d TCA9534@0x%02X INT=%d | BOOT=%d | WS2812 x%d on %d\n"
+            "  Battery ADC GPIO%d (x%d) | UART0 TX=%d RX=%d\n",
+-           esp_app_get_description()->version, BOARD_SPI_SCK, BOARD_SPI_MOSI, BOARD_SPI_MISO, BOARD_LCD_CS, BOARD_LCD_DC, BOARD_LCD_RST, BOARD_LCD_BL,
++           esp_app_get_description()->version, BOARD_NAME,
++           BOARD_SPI_SCK, BOARD_SPI_MOSI, BOARD_SPI_MISO, BOARD_LCD_CS, BOARD_LCD_DC, BOARD_LCD_RST, BOARD_LCD_BL,
+            BOARD_SD_CS, BOARD_I2C_SCL, BOARD_I2C_SDA, BOARD_TCA9534_ADDR, BOARD_TCA9534_INT, BOARD_BOOT_BTN,
+            BOARD_RGB_COUNT, BOARD_RGB_GPIO, BOARD_BAT_ADC_GPIO, BOARD_BAT_DIVIDER, BOARD_UART_TX, BOARD_UART_RX);
+     int mv = bsp_battery_mv();
+@@ -322,6 +327,56 @@ static int cmd_reboot(int argc, char **argv)
+     return 0;
+ }
+ 
++#if CONFIG_BSP_BOARD_DIY
++// A breadboard's dev board often has two USB ports: the USB-to-UART chip's
++// (UART0, the REPL) and the chip's own (USB Serial/JTAG), which only got the
++// output. Lines typed on the second run here too, echoed, without a prompt.
++static TaskHandle_t s_usb_task;
++
++static void usb_console_task(void *arg)
++{
++    static char line[512];
++    size_t n = 0;
++    for (;;) {
++        uint8_t c;
++        if (usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY) <= 0) {
++            continue;
++        }
++        if (c == '\r' || c == '\n') {
++            if (n) {
++                usb_serial_jtag_write_bytes("\r\n", 2, 0);
++                line[n] = 0;
++                n = 0;
++                int ret;
++                if (esp_console_run(line, &ret) == ESP_ERR_NOT_FOUND) {
++                    printf("unknown command (help lists them)\n");
++                }
++            }
++        } else if (c == 0x7f || c == '\b') {
++            if (n) {
++                n--;
++                usb_serial_jtag_write_bytes("\b \b", 3, 0);
++            }
++        } else if (c >= 0x20 && n < sizeof(line) - 1) {
++            line[n++] = (char)c;
++            usb_serial_jtag_write_bytes(&c, 1, 0);
++        }
++    }
++}
++
++static void usb_console_start(void)
++{
++    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
++    cfg.rx_buffer_size = 4 * 1024;          // a whole lua recv block, while this task waits for the CPU
++    if (usb_serial_jtag_driver_install(&cfg) != ESP_OK) {
++        ESP_LOGW(TAG, "no console on the native USB port");
++        return;
++    }
++    usb_serial_jtag_vfs_use_driver();       // the output it already gets goes through the driver now
++    xTaskCreate(usb_console_task, "console_usb", 5 * 1024, NULL, 2, &s_usb_task);
++}
++#endif
++
+ // The REPL waits in our command meanwhile, so the UART is ours: read its
+ // driver directly (the REPL installed it). stdin's VFS would add nothing, and
+ // in the console's CR mode it holds no byte back.
+@@ -330,6 +385,11 @@ int console_stream_read(void *buf, size_t n, int timeout_ms)
+     if (!n) {
+         return 0;                           // asking whether this console streams: it does
+     }
++#if CONFIG_BSP_BOARD_DIY
++    if (xTaskGetCurrentTaskHandle() == s_usb_task) {
++        return usb_serial_jtag_read_bytes(buf, n, pdMS_TO_TICKS(timeout_ms));   // the line came from USB
++    }
++#endif
+     int got = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buf, n, pdMS_TO_TICKS(timeout_ms));
+     return got < 0 ? -1 : got;
+ }
+@@ -372,6 +432,9 @@ static void start_now(void)
+     }
+     esp_console_register_help_command();
+     ESP_ERROR_CHECK(esp_console_start_repl(repl));
++#if CONFIG_BSP_BOARD_DIY
++    usb_console_start();
++#endif
+     ESP_LOGI(TAG, "console ready, type 'help'");
+ }
+ 
+diff --git a/main/core/console.h b/main/core/console.h
+index ea1ac92..fd5d9fe 100644
+--- a/main/core/console.h
++++ b/main/core/console.h
+@@ -4,8 +4,8 @@
+ 
+ void console_start(void);
+ 
+-// Raw console input, for a command that takes a stream after its line
+-// (lua recv): up to n bytes, waiting at most timeout_ms for them (0: none
+-// came), -1 where the console has no input stream (the emulator's). n = 0
+-// only asks which. Call it only from inside a command.
++// Raw input from the command's console, for a command that takes a stream
++// after its line (lua recv): up to n bytes, waiting at most timeout_ms for
++// them (0: none came), -1 where the console has no input stream (the
++// emulator's). n = 0 only asks which. Call it only from inside a command.
+ int console_stream_read(void *buf, size_t n, int timeout_ms);
+diff --git a/main/core/launcher.c b/main/core/launcher.c
+index b7eec7c..2f19d06 100644
+--- a/main/core/launcher.c
++++ b/main/core/launcher.c
+@@ -113,6 +113,29 @@ static void render(void)
+     }
+ }
+ 
++#if CONFIG_OS_TOUCH
++// A tapped tile opens its app; a swipe on the grid turns the page, keeping
++// the same place on it.
++static void tile_tap(lv_event_t *e)
++{
++    ui_tap_t *t = lv_event_get_param(e);
++    int slot = (int)(intptr_t)lv_event_get_user_data(e);
++    int page = s_sel / PER_PAGE, pages = (s_count + PER_PAGE - 1) / PER_PAGE;
++    t->handled = true;
++    if (!t->swipe) {
++        s_sel = page * PER_PAGE + slot;
++        render();
++        ui_tap_add(t, OS_KEY_SELECT);
++        return;
++    }
++    int next = page + t->swipe;
++    if (next >= 0 && next < pages) {
++        s_sel = LV_MIN(next * PER_PAGE + s_sel % PER_PAGE, s_count - 1);
++        render();
++    }
++}
++#endif
++
+ static void enter(lv_obj_t *root)
+ {
+     s_root = root;
+@@ -131,6 +154,9 @@ static void enter(lv_obj_t *root)
+         lv_obj_set_style_text_align(s_names[i], LV_TEXT_ALIGN_CENTER, 0);
+         lv_label_set_long_mode(s_names[i], LV_LABEL_LONG_MODE_DOTS);
+         lv_obj_align(s_names[i], LV_ALIGN_BOTTOM_MID, 0, -2);
++#if CONFIG_OS_TOUCH
++        ui_on_tap(t, tile_tap, (void *)(intptr_t)i);
++#endif
+     }
+     s_dots = lv_obj_create(root);
+     lv_obj_remove_style_all(s_dots);
+diff --git a/main/core/os.c b/main/core/os.c
+index aacf79d..df1e97a 100644
+--- a/main/core/os.c
++++ b/main/core/os.c
+@@ -19,6 +19,9 @@
+ #include "os_wifi.h"
+ #include "os_settings.h"
+ #include "ui.h"
++#if CONFIG_OS_TOUCH
++#include "os_touch.h"
++#endif
+ 
+ static const char *TAG = "os";
+ 
+@@ -142,6 +145,11 @@ static void status_create(lv_obj_t *scr)
+     lv_obj_align(s_batt, LV_ALIGN_RIGHT_MID, -6, 0);
+     s_wifi = ui_label(bar, &lv_font_montserrat_14, COL_DIM, LV_SYMBOL_WIFI);
+     lv_obj_align(s_wifi, LV_ALIGN_RIGHT_MID, -76, 0);
++#if CONFIG_OS_TOUCH
++    ui_tap_key(logo, OS_KEY_HOME);
++    ui_tap_key(s_title, OS_KEY_BACK);
++    ui_tap_key(bar, OS_KEY_NONE);
++#endif
+ 
+     // Brand gradient hairline under the bar.
+     lv_obj_t *line = ui_gradient_bar(bar, 0, OS_STATUS_H - 2, BOARD_LCD_H_RES, 2);
+@@ -259,6 +267,111 @@ typedef struct {
+     char text[];
+ } confirm_req_t;
+ 
++#if CONFIG_OS_TOUCH
++// Touch answers through two targets: Cancel, and a bar that must be held
++// down for CONFIRM_HOLD_MS while it fills. The press has to start on the bar
++// after CONFIRM_ARM_MS, so a touch already under way when the dialog opened
++// never counts; sliding off or lifting early starts over. Console-injected
++// touch is ignored here.
++#define CONFIRM_HOLD_MS 1200
++
++static void confirm_close(bool yes);
++
++static lv_obj_t *s_modal_yes, *s_modal_fill, *s_modal_no;
++static int64_t s_hold_from;             // now_ms() the hold began, 0: none
++static bool s_press_no;                 // this press began on Cancel
++
++static void fill_width(void *obj, int32_t w)
++{
++    lv_obj_set_width(obj, w);
++}
++
++static void hold_reset(void)
++{
++    s_hold_from = 0;
++    if (s_modal_fill) {
++        lv_anim_delete(s_modal_fill, fill_width);
++        lv_obj_set_width(s_modal_fill, 0);
++    }
++}
++
++static bool on_obj(lv_obj_t *o, int x, int y)
++{
++    lv_area_t a;
++    lv_point_t p = { x, y };
++    lv_obj_get_coords(o, &a);
++    return lv_area_is_point_on(&a, &p, 0);
++}
++
++static lv_obj_t *confirm_button(lv_obj_t *row, int w, uint32_t border)
++{
++    lv_obj_t *b = lv_obj_create(row);
++    lv_obj_remove_style_all(b);
++    lv_obj_set_size(b, w, 30);
++    lv_obj_set_style_radius(b, 6, 0);
++    lv_obj_set_style_border_width(b, 1, 0);
++    lv_obj_set_style_border_color(b, ui_col(border), 0);
++    lv_obj_set_scrollable(b, false);
++    return b;
++}
++
++static void confirm_targets(lv_obj_t *box)
++{
++    lv_obj_t *row = lv_obj_create(box);
++    lv_obj_remove_style_all(row);
++    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
++    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
++    lv_obj_set_style_pad_column(row, 10, 0);
++    s_modal_no = confirm_button(row, 90, COL_BORDER);
++    lv_obj_center(ui_label(s_modal_no, &sol_font_14, COL_TEXT, "Cancel"));
++    s_modal_yes = confirm_button(row, 150, COL_GREEN);
++    s_modal_fill = lv_obj_create(s_modal_yes);
++    lv_obj_remove_style_all(s_modal_fill);
++    lv_obj_set_size(s_modal_fill, 0, lv_pct(100));
++    lv_obj_set_style_radius(s_modal_fill, 5, 0);
++    lv_obj_set_style_bg_opa(s_modal_fill, LV_OPA_COVER, 0);
++    lv_obj_set_style_bg_color(s_modal_fill, ui_col(COL_GREEN), 0);
++    lv_obj_center(ui_label(s_modal_yes, &sol_font_14, COL_TEXT, "Hold to approve"));
++}
++
++bool os_confirm_touch(os_touch_phase_t ph, int x, int y, bool synthetic)
++{
++    if (!s_modal || synthetic) {
++        return s_modal != NULL;
++    }
++    switch (ph) {
++    case OS_TOUCH_PRESS:
++        s_press_no = on_obj(s_modal_no, x, y);
++        if (on_obj(s_modal_yes, x, y) && now_ms() >= s_modal_armed) {
++            s_hold_from = now_ms();
++            lv_anim_t a;
++            lv_anim_init(&a);
++            lv_anim_set_var(&a, s_modal_fill);
++            lv_anim_set_exec_cb(&a, fill_width);
++            lv_anim_set_values(&a, 0, lv_obj_get_content_width(s_modal_yes));
++            lv_anim_set_duration(&a, CONFIRM_HOLD_MS);
++            lv_anim_start(&a);
++        }
++        break;
++    case OS_TOUCH_MOVE:
++        if (s_hold_from && !on_obj(s_modal_yes, x, y)) {
++            hold_reset();
++        }
++        break;
++    case OS_TOUCH_RELEASE:
++        if (s_hold_from) {
++            hold_reset();                   // lifted before the bar was full
++        } else if (s_press_no && on_obj(s_modal_no, x, y)) {
++            s_press_no = false;
++            confirm_close(false);
++        }
++        s_press_no = false;
++        break;
++    }
++    return true;
++}
++#endif
++
+ static void confirm_close(bool yes)
+ {
+     if (!s_modal) {
+@@ -266,6 +379,11 @@ static void confirm_close(bool yes)
+     }
+     lv_obj_delete(s_modal);
+     s_modal = NULL;
++#if CONFIG_OS_TOUCH
++    s_modal_yes = s_modal_fill = s_modal_no = NULL;
++    s_hold_from = 0;
++    s_press_no = false;
++#endif
+     os_confirm_cb_t cb = s_modal_cb;
+     s_modal_cb = NULL;
+     if (cb) {
+@@ -304,8 +422,14 @@ static void confirm_show(const char *text, os_confirm_cb_t done, void *ctx)
+     lv_obj_set_width(msg, CONFIRM_W - 26);
+     lv_label_set_long_mode(msg, LV_LABEL_LONG_MODE_WRAP);
+     lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
++#if CONFIG_OS_TOUCH
++    confirm_targets(box);
++#endif
+     ui_label(box, &sol_mono_12, COL_DIM, "SELECT yes     CANCEL no");
+     lv_obj_center(box);
++#if CONFIG_OS_TOUCH
++    lv_obj_update_layout(s_modal);          // the targets' coordinates, for os_confirm_touch
++#endif
+ }
+ 
+ static void confirm_posted(void *arg)
+@@ -449,6 +573,31 @@ static void dispatch(os_key_t key, bool repeat)
+     }
+ }
+ 
++#if CONFIG_OS_TOUCH
++// While the confirm dialog is open, touch answers it only through its own
++// targets (os_confirm_touch), never with keys.
++void os_touch_key(os_key_t key, bool repeat)
++{
++    if (!s_modal) {
++        dispatch(key, repeat);
++    }
++}
++
++// The hold bar is full: approve if the finger is still on it.
++static void confirm_hold_check(int64_t now)
++{
++    if (!s_hold_from || now < s_hold_from + CONFIRM_HOLD_MS) {
++        return;
++    }
++    int x, y;
++    if (os_touch_live(&x, &y) && on_obj(s_modal_yes, x, y)) {
++        confirm_close(true);
++    } else {
++        hold_reset();
++    }
++}
++#endif
++
+ static bool post(os_event_t ev)
+ {
+     return s_q && xQueueSend(s_q, &ev, 0) == pdTRUE;
+@@ -486,6 +635,12 @@ void os_launch_id(const char *id)
+         os_launch(&os_calibrate);
+         return;
+     }
++#if CONFIG_OS_TOUCH
++    if (!strcmp(id, os_touchcal.id)) {
++        os_launch(&os_touchcal);
++        return;
++    }
++#endif
+     if (!strcmp(id, app_update.id)) {
+         os_launch(&app_update);
+         return;
+@@ -686,6 +841,11 @@ static void os_task(void *arg)
+         if (held != OS_KEY_NONE && next_repeat < wake) {
+             wake = next_repeat;
+         }
++#if CONFIG_OS_TOUCH
++        if (s_hold_from && s_hold_from + CONFIRM_HOLD_MS < wake) {
++            wake = s_hold_from + CONFIRM_HOLD_MS;
++        }
++#endif
+         os_event_t ev;
+         bool got = xQueueReceive(s_q, &ev, wake > now ? pdMS_TO_TICKS(wake - now) : 0);
+ 
+@@ -694,6 +854,9 @@ static void os_task(void *arg)
+             handle(&ev, &held, &next_repeat, &held_bit);
+         }
+         now = now_ms();
++#if CONFIG_OS_TOUCH
++        confirm_hold_check(now);
++#endif
+         if (held != OS_KEY_NONE && now >= next_repeat) {
+             uint32_t pressed = bsp_buttons_get();
+             if (pressed & held_bit) {
+@@ -779,6 +942,9 @@ void os_start(void)
+     if (bsp_buttons_start(on_buttons) != ESP_OK) {
+         ESP_LOGE(TAG, "buttons unavailable; use the console 'key' command");
+     }
++#if CONFIG_OS_TOUCH
++    os_touch_start();
++#endif
+     xTaskCreate(os_task, "os", 6144, NULL, 4, &s_task);
+ }
+ 
+diff --git a/main/core/os_api.c b/main/core/os_api.c
+index dc5ae17..5ea087f 100644
+--- a/main/core/os_api.c
++++ b/main/core/os_api.c
+@@ -59,6 +59,10 @@ typedef struct req {
+     os_api_cb_t cb;
+     void *ctx;
+     bool download, taken, cancelled;
++    bool external;                      // path is a full URL off the badge server (os_api_fetch): no bearer
++    bool upload;                        // os_api_upload: dest (a file) or body_len bytes of body, as name
++    const char *bearer, *name;          // an upload's own token and filename
++    size_t body_len;
+     int status;
+     char *resp;                         // NUL-terminated answer (or manifest), NULL if none
+ } req_t;
+@@ -91,14 +95,19 @@ bool os_api_online(void)
+ // ---------------------------------------------------------------------------
+ // Requests
+ 
++static esp_err_t push(req_t *r);
++static void free_req(req_t *r);
++
+ static esp_err_t enqueue(const char *method, const char *path, const char *body, const char *dest, size_t cap,
+-                         bool download, os_api_cb_t cb, void *ctx)
++                         bool download, bool external, os_api_cb_t cb, void *ctx)
+ {
+-    if (!method || !path || path[0] != '/' || strlen(method) >= sizeof(((req_t *)0)->method) ||
++    bool url_ok = external ? (!strncmp(path ? path : "", "https://", 8) && strlen(path) < URL_MAX)
++                           : (path && path[0] == '/');
++    if (!method || !url_ok || strlen(method) >= sizeof(((req_t *)0)->method) ||
+             (body && strlen(body) > BODY_MAX)) {
+         return ESP_ERR_INVALID_ARG;
+     }
+-    if (!os_api_online()) {
++    if (external ? os_wifi_state() != OS_WIFI_CONNECTED : !os_api_online()) {
+         return ESP_ERR_INVALID_STATE;
+     }
+     size_t lp = strlen(path) + 1, lb = body ? strlen(body) + 1 : 0, ld = dest ? strlen(dest) + 1 : 0;
+@@ -117,9 +126,16 @@ static esp_err_t enqueue(const char *method, const char *path, const char *body,
+     }
+     r->cap = cap;
+     r->download = download;
++    r->external = external;
+     r->cb = cb;
+     r->ctx = ctx;
+ 
++    return push(r);
++}
++
++// Queue r (freed if the queue is full) and wake the cloud task.
++static esp_err_t push(req_t *r)
++{
+     xSemaphoreTake(s_lock, portMAX_DELAY);
+     int n = 0;
+     req_t **tail = &s_reqs;
+@@ -128,7 +144,7 @@ static esp_err_t enqueue(const char *method, const char *path, const char *body,
+     }
+     if (n >= QUEUE_MAX) {
+         xSemaphoreGive(s_lock);
+-        free(r);
++        free_req(r);
+         return ESP_ERR_NO_MEM;
+     }
+     *tail = r;
+@@ -140,7 +156,52 @@ static esp_err_t enqueue(const char *method, const char *path, const char *body,
+ esp_err_t os_api_call(const char *method, const char *path, const char *body, size_t resp_cap,
+                       os_api_cb_t cb, void *ctx)
+ {
+-    return enqueue(method, path, body, NULL, resp_cap ? resp_cap : OS_API_RESP_DEFAULT, false, cb, ctx);
++    return enqueue(method, path, body, NULL, resp_cap ? resp_cap : OS_API_RESP_DEFAULT, false, false, cb, ctx);
++}
++
++esp_err_t os_api_fetch(const char *method, const char *url, const char *body, size_t resp_cap,
++                       os_api_cb_t cb, void *ctx)
++{
++    return enqueue(method, url, body, NULL, resp_cap ? resp_cap : OS_API_RESP_DEFAULT, false, true, cb, ctx);
++}
++
++esp_err_t os_api_upload(const char *url, const char *bearer, const char *file, const void *data, size_t len,
++                        const char *name, size_t resp_cap, os_api_cb_t cb, void *ctx)
++{
++    if (!url || strncmp(url, "https://", 8) || strlen(url) >= URL_MAX || !name || !name[0] ||
++            (!file && (!data || len > BODY_MAX)) || (bearer && strlen(bearer) > 200)) {
++        return ESP_ERR_INVALID_ARG;
++    }
++    if (os_wifi_state() != OS_WIFI_CONNECTED) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    size_t lu = strlen(url) + 1, lk = bearer ? strlen(bearer) + 1 : 0, ln = strlen(name) + 1;
++    size_t lf = file ? strlen(file) + 1 : 0, ld = file ? 0 : len;
++    req_t *r = calloc(1, sizeof(*r) + lu + lk + ln + lf + ld);
++    if (!r) {
++        return ESP_ERR_NO_MEM;
++    }
++    char *p = (char *)(r + 1);
++    strcpy(r->method, "POST");
++    r->path = memcpy(p, url, lu);
++    p += lu;
++    if (bearer) {
++        r->bearer = memcpy(p, bearer, lk);
++        p += lk;
++    }
++    r->name = memcpy(p, name, ln);
++    p += ln;
++    if (file) {
++        r->dest = memcpy(p, file, lf);
++    } else {
++        r->body = memcpy(p, data, ld);
++        r->body_len = ld;
++    }
++    r->cap = resp_cap ? resp_cap : OS_API_RESP_DEFAULT;
++    r->external = r->upload = true;
++    r->cb = cb;
++    r->ctx = ctx;
++    return push(r);
+ }
+ 
+ esp_err_t os_api_download(const char *path, const char *dest, size_t max_bytes, os_api_cb_t cb, void *ctx)
+@@ -148,7 +209,7 @@ esp_err_t os_api_download(const char *path, const char *dest, size_t max_bytes,
+     if (!dest || !dest[0]) {
+         return ESP_ERR_INVALID_ARG;
+     }
+-    return enqueue("GET", path, NULL, dest, max_bytes, true, cb, ctx);
++    return enqueue("GET", path, NULL, dest, max_bytes, true, false, cb, ctx);
+ }
+ 
+ void os_api_prewarm(void)
+@@ -193,6 +254,15 @@ static void unlink_req(req_t *r)
+     xSemaphoreGive(s_lock);
+ }
+ 
++static void free_req(req_t *r)
++{
++    if (r->bearer) {
++        memset((char *)r->bearer, 0, strlen(r->bearer));   // an upload's own key
++    }
++    free(r->resp);
++    free(r);
++}
++
+ // OS task.
+ static void deliver(void *arg)
+ {
+@@ -204,8 +274,7 @@ static void deliver(void *arg)
+     if (!cancelled && r->cb) {
+         r->cb(r->status, r->status ? (r->resp ? r->resp : "") : NULL, r->ctx);
+     }
+-    free(r->resp);
+-    free(r);
++    free_req(r);
+ }
+ 
+ static void post_result(req_t *r)
+@@ -218,8 +287,7 @@ static void post_result(req_t *r)
+     }
+     ESP_LOGE(TAG, "OS queue full: dropped the answer to %s %s", r->method, r->path);
+     unlink_req(r);
+-    free(r->resp);
+-    free(r);
++    free_req(r);
+ }
+ 
+ // The oldest request nobody took yet; cancelled ones are dropped on the way.
+@@ -233,7 +301,7 @@ static req_t *take_next(void)
+             pp = &q->next;
+         } else if (q->cancelled) {
+             *pp = q->next;
+-            free(q);
++            free_req(q);
+         } else {
+             q->taken = true;
+             r = q;
+@@ -286,9 +354,26 @@ static void run_download(req_t *r, const char *url, const char *bearer)
+     free(b64);
+ }
+ 
++static void run_external(req_t *r)
++{
++    if (os_wifi_state() != OS_WIFI_CONNECTED || !(r->resp = malloc(r->cap))) {
++        return;                             // status 0
++    }
++    esp_err_t e = r->upload ? os_http_upload(r->path, r->bearer, r->dest, r->body, r->body_len, r->name,
++                                             r->resp, r->cap, &r->status)
++                            : os_http_request(r->method, r->path, NULL, r->body, r->resp, r->cap, &r->status);
++    if (e != ESP_OK) {
++        r->status = 0;
++    }
++}
++
+ static void run(req_t *r, bool online)
+ {
+     char url[URL_MAX], bearer[96];
++    if (r->external) {
++        run_external(r);
++        return;
++    }
+     if (!online || !os_cloud_bearer(bearer, sizeof(bearer))) {
+         return;                             // status 0
+     }
+diff --git a/main/core/os_api.h b/main/core/os_api.h
+index b10245f..6bd2a7d 100644
+--- a/main/core/os_api.h
++++ b/main/core/os_api.h
+@@ -35,6 +35,18 @@ esp_err_t os_api_call(const char *method, const char *path, const char *body, si
+ // most max_bytes. dest is replaced only by a complete 2xx body (written to
+ // dest.part first). cb gets status and body = the X-App-Manifest header
+ // (decoded) or "". No card: status 0.
++// os_api_call for a full https:// URL off the badge server (a Solana RPC node, say):
++// no bearer, and it needs only Wi-Fi, not a registered badge. Same worker, queue
++// and callback rules; the worker's one connection moves to that origin and back.
++esp_err_t os_api_fetch(const char *method, const char *url, const char *body, size_t resp_cap,
++                       os_api_cb_t cb, void *ctx);
++
++// POST one file to an IPFS-style /api/v0/add URL (os_http_upload) with its own
++// bearer token: the file at path `file`, or len (<= 4 KB) bytes at data. Needs
++// only Wi-Fi. The token and data are copied.
++esp_err_t os_api_upload(const char *url, const char *bearer, const char *file, const void *data, size_t len,
++                        const char *name, size_t resp_cap, os_api_cb_t cb, void *ctx);
++
+ esp_err_t os_api_download(const char *path, const char *dest, size_t max_bytes, os_api_cb_t cb, void *ctx);
+ 
+ // OS task (on_exit): no callback for ctx runs after this. A NULL ctx is never
+diff --git a/main/core/os_cloud.c b/main/core/os_cloud.c
+index c444d6a..7c839c8 100644
+--- a/main/core/os_cloud.c
++++ b/main/core/os_cloud.c
+@@ -277,6 +277,9 @@ static void parse(const char *body, hello_t *r)
+     const char *us = cJSON_GetStringValue(cJSON_GetObjectItem(up, "sha256"));
+     int usize = num_or(up, "size", 0);
+     bool uok = uv && uv[0] && strlen(uv) < sizeof(r->update) && us && strlen(us) == 64 && usize > 0;
++#if CONFIG_BSP_BOARD_DIY
++    uok = false;                        // the badge's firmware: it doesn't run on a breadboard build
++#endif
+     for (const char *p = uv; uok && *p; p++) {
+         uok = *p > 0x20 && *p < 0x7F;   // shown on screen and sent back in a URL
+     }
+diff --git a/main/core/os_http.c b/main/core/os_http.c
+index 4bfa114..8998807 100644
+--- a/main/core/os_http.c
++++ b/main/core/os_http.c
+@@ -16,6 +16,7 @@
+ #include <string.h>
+ #include <strings.h>
+ #include <stdlib.h>
++#include <sys/stat.h>
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/semphr.h"
+ #include "esp_http_client.h"
+@@ -55,6 +56,16 @@ static bool s_ticket;                   // a TLS connection to s_origin succeede
+ static int64_t s_last_ms;
+ static header_ctx_t s_hdr;              // what the event handler captures for this request
+ static volatile size_t s_dl_done, s_dl_total;   // os_http_progress()
++
++// os_http_upload's one file part, while its request runs (under s_lock).
++typedef struct {
++    FILE *f;                            // the file's bytes, or
++    const char *data;                   // these
++    size_t len;
++    const char *name;                   // the part's filename
++} upload_t;
++static const upload_t *s_up;
++#define BOUNDARY "solana-os-badge-7d3a9f"
+ static struct {
+     uint32_t requests, connects;
+ } s_n;
+@@ -154,16 +165,58 @@ static esp_err_t prepare(const char *url)
+ 
+ // Send one request on the current connection (opening it if needed) and read
+ // the status and headers.
++static esp_err_t write_all(const char *p, int len)
++{
++    for (int off = 0; off < len;) {
++        int n = esp_http_client_write(s_client, p + off, len - off);
++        if (n <= 0) {
++            return ESP_ERR_HTTP_WRITE_DATA;
++        }
++        off += n;
++    }
++    return ESP_OK;
++}
++
++// s_up as multipart/form-data: its part's head, its bytes, the closing line.
++static const char UP_TAIL[] = "\r\n--" BOUNDARY "--\r\n";
++
++static int up_head(char *out, size_t n)
++{
++    return snprintf(out, n, "--" BOUNDARY "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
++                    "Content-Type: application/octet-stream\r\n\r\n", s_up->name);
++}
++
++static esp_err_t write_upload(const char *head, int hlen)
++{
++    static char chunk[1024];            // one request at a time (s_lock)
++    esp_err_t err = write_all(head, hlen);
++    if (s_up->f) {
++        fseek(s_up->f, 0, SEEK_SET);    // again on a retry
++        for (size_t left = s_up->len; err == ESP_OK && left;) {
++            size_t n = fread(chunk, 1, left < sizeof(chunk) ? left : sizeof(chunk), s_up->f);
++            err = n ? write_all(chunk, (int)n) : ESP_FAIL;
++            left -= n;
++        }
++    } else if (err == ESP_OK) {
++        err = write_all(s_up->data, (int)s_up->len);
++    }
++    return err == ESP_OK ? write_all(UP_TAIL, sizeof(UP_TAIL) - 1) : err;
++}
++
+ static esp_err_t send_request(const char *method, const char *bearer, const char *body)
+ {
+     esp_http_client_set_method(s_client, method_of(method));
+-    if (body) {
++    char head[200];
++    int hlen = s_up ? up_head(head, sizeof(head)) : 0;
++    if (s_up) {
++        esp_http_client_set_header(s_client, "Content-Type", "multipart/form-data; boundary=" BOUNDARY);
++    } else if (body) {
+         esp_http_client_set_header(s_client, "Content-Type", "application/json");
+     } else {
+         esp_http_client_delete_header(s_client, "Content-Type");
+     }
+     if (bearer && bearer[0]) {
+-        char auth[160];
++        char auth[256];
+         snprintf(auth, sizeof(auth), "Bearer %s", bearer);
+         esp_http_client_set_header(s_client, "Authorization", auth);   // copies it
+         // Not left on the stack: a panic's stack dump would print the badge secret.
+@@ -172,17 +225,13 @@ static esp_err_t send_request(const char *method, const char *bearer, const char
+     } else {
+         esp_http_client_delete_header(s_client, "Authorization");
+     }
+-    int len = body ? strlen(body) : 0;
++    int len = s_up ? hlen + (int)s_up->len + (int)sizeof(UP_TAIL) - 1 : body ? (int)strlen(body) : 0;
+     if (!s_open) {
+         s_n.connects++;
+     }
+     esp_err_t err = esp_http_client_open(s_client, len);
+-    for (int off = 0; err == ESP_OK && off < len;) {
+-        int n = esp_http_client_write(s_client, body + off, len - off);
+-        if (n <= 0) {
+-            err = ESP_ERR_HTTP_WRITE_DATA;
+-        }
+-        off += n;
++    if (err == ESP_OK) {
++        err = s_up ? write_upload(head, hlen) : write_all(body, len);
+     }
+     if (err == ESP_OK) {
+         int64_t r = esp_http_client_fetch_headers(s_client);
+@@ -242,13 +291,14 @@ static void lock(void)
+     xSemaphoreTake(s_lock, portMAX_DELAY);
+ }
+ 
+-esp_err_t os_http_request(const char *method, const char *url, const char *bearer, const char *body,
+-                          char *resp, size_t cap, int *status)
++static esp_err_t request(const char *method, const char *url, const char *bearer, const char *body,
++                         const upload_t *up, char *resp, size_t cap, int *status)
+ {
+     if (cap) {
+         resp[0] = 0;
+     }
+     lock();
++    s_up = up;
+     size_t free0 = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+     heap_caps_monitor_local_minimum_free_size_start();
+     bool fresh = !s_open;
+@@ -278,10 +328,45 @@ esp_err_t os_http_request(const char *method, const char *url, const char *beare
+                  (unsigned)low, (unsigned)(free0 - low));
+     }
+     ESP_LOGD(TAG, "%s %s -> %d (%u B, %s)", method, url, *status, (unsigned)got, fresh ? "new connection" : "reused");
++    s_up = NULL;
+     xSemaphoreGive(s_lock);
+     return err;
+ }
+ 
++esp_err_t os_http_request(const char *method, const char *url, const char *bearer, const char *body,
++                          char *resp, size_t cap, int *status)
++{
++    return request(method, url, bearer, body, NULL, resp, cap, status);
++}
++
++esp_err_t os_http_upload(const char *url, const char *bearer, const char *path, const void *data, size_t len,
++                         const char *filename, char *resp, size_t cap, int *status)
++{
++    upload_t up = { .data = data, .len = len, .name = filename };
++    *status = 0;
++    if (cap) {
++        resp[0] = 0;
++    }
++    if (path) {
++        struct stat st;
++        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || !(up.f = fopen(path, "rb"))) {
++            return ESP_ERR_NOT_FOUND;
++        }
++        up.len = st.st_size;
++    }
++    if (up.len > OS_HTTP_UPLOAD_MAX || strpbrk(filename, "\"\r\n")) {
++        if (up.f) {
++            fclose(up.f);
++        }
++        return ESP_ERR_INVALID_SIZE;
++    }
++    esp_err_t err = request("POST", url, bearer, NULL, &up, resp, cap, status);
++    if (up.f) {
++        fclose(up.f);
++    }
++    return err;
++}
++
+ esp_err_t os_http_download(const char *url, const char *bearer, const char *path, size_t max,
+                            const char *header, char *hdr_out, size_t hdr_cap, int *status)
+ {
+diff --git a/main/core/os_http.h b/main/core/os_http.h
+index b62e976..6148014 100644
+--- a/main/core/os_http.h
++++ b/main/core/os_http.h
+@@ -18,6 +18,14 @@
+ esp_err_t os_http_request(const char *method, const char *url, const char *bearer, const char *body,
+                           char *resp, size_t cap, int *status);
+ 
++// POST one file as multipart/form-data (part "file", that filename), as IPFS's
++// /api/v0/add takes it: the file at path, streamed from the card, or len bytes
++// at data when path is NULL. ESP_ERR_NOT_FOUND: no such file;
++// ESP_ERR_INVALID_SIZE: over OS_HTTP_UPLOAD_MAX. The answer as os_http_request's.
++#define OS_HTTP_UPLOAD_MAX  (2 * 1024 * 1024)
++esp_err_t os_http_upload(const char *url, const char *bearer, const char *path, const void *data, size_t len,
++                         const char *filename, char *resp, size_t cap, int *status);
++
+ // GET url and stream a 2xx body into the file at path (created or truncated),
+ // at most max bytes: a longer body fails with ESP_ERR_INVALID_SIZE (the file
+ // is then incomplete; the caller removes it). Other statuses leave the file
+diff --git a/main/core/ui.c b/main/core/ui.c
+index 8c5d713..3de8b99 100644
+--- a/main/core/ui.c
++++ b/main/core/ui.c
+@@ -95,9 +95,59 @@ lv_obj_t *ui_hint(lv_obj_t *root, const char *text)
+     lv_obj_set_style_border_color(bar, ui_col(COL_BORDER), 0);
+     lv_obj_t *l = ui_label(bar, &sol_mono_12, COL_DIM, text);
+     lv_obj_align(l, LV_ALIGN_LEFT_MID, 6, 0);
++#if CONFIG_OS_TOUCH
++    ui_tap_key(bar, OS_KEY_NONE);   // the hint isn't a button: no SELECT for a tap on it
++#endif
+     return l;
+ }
+ 
++#if CONFIG_OS_TOUCH
++// ---------------------------------------------------------------------------
++// Touch targets
++
++uint32_t ui_tap_event(void)
++{
++    static uint32_t id;
++    if (!id) {
++        id = lv_event_register_id();
++    }
++    return id;
++}
++
++void ui_tap_add(ui_tap_t *t, os_key_t key)
++{
++    if (t->n < UI_TAP_KEYS) {
++        t->keys[t->n++] = key;
++    }
++}
++
++void ui_on_tap(lv_obj_t *obj, lv_event_cb_t cb, void *user_data)
++{
++    lv_obj_set_clickable(obj, true);
++    lv_obj_add_event_cb(obj, cb, ui_tap_event(), user_data);
++}
++
++static void tap_key(lv_event_t *e)
++{
++    ui_tap_t *t = lv_event_get_param(e);
++    os_key_t key = (os_key_t)(intptr_t)lv_event_get_user_data(e);
++    if (!t->swipe) {
++        t->handled = true;
++        if (key != OS_KEY_NONE) {
++            ui_tap_add(t, key);
++        }
++    }
++}
++
++void ui_tap_key(lv_obj_t *obj, os_key_t key)
++{
++    if (key != OS_KEY_NONE) {
++        lv_obj_set_ext_click_area(obj, 6);      // small labels: a little room around them
++    }
++    ui_on_tap(obj, tap_key, (void *)(intptr_t)key);
++}
++#endif
++
+ // ---------------------------------------------------------------------------
+ // Tabs
+ 
+@@ -141,7 +191,7 @@ void ui_tabs_select(lv_obj_t *tabs, int index)
+ #define MAX_ROWS    8
+ 
+ typedef struct {
+-    lv_obj_t *obj, *mark, *title, *sub, *right;
++    lv_obj_t *obj, *mark, *icon, *title, *sub, *right;     // icon: made when a row first has one
+ } row_objs_t;
+ 
+ struct ui_list {
+@@ -157,6 +207,29 @@ static void list_deleted(lv_event_t *e)
+     lv_free(lv_event_get_user_data(e));
+ }
+ 
++#if CONFIG_OS_TOUCH
++// A tapped row: Up/Down to it, then SELECT, all through the app's on_key.
++static void row_tap(lv_event_t *e)
++{
++    ui_tap_t *t = lv_event_get_param(e);
++    ui_list_t *l = lv_event_get_user_data(e);
++    lv_obj_t *obj = lv_event_get_current_target_obj(e);
++    for (int i = 0; i < l->visible && !t->swipe; i++) {
++        if (l->rows[i].obj == obj) {
++            int d = l->top + i - l->sel;
++            for (; d > 0; d--) {
++                ui_tap_add(t, OS_KEY_DOWN);
++            }
++            for (; d < 0; d++) {
++                ui_tap_add(t, OS_KEY_UP);
++            }
++            ui_tap_add(t, OS_KEY_SELECT);
++            t->handled = true;
++        }
++    }
++}
++#endif
++
+ ui_list_t *ui_list_create(lv_obj_t *parent, int y, int h, ui_row_cb_t cb, void *ctx)
+ {
+     return ui_list_create_at(parent, 0, y, OS_ROOT_W, h, cb, ctx);
+@@ -206,7 +279,13 @@ ui_list_t *ui_list_create_at(lv_obj_t *parent, int x, int y, int w, int h, ui_ro
+         lv_label_set_long_mode(r->sub, LV_LABEL_LONG_MODE_DOTS);
+         r->right = ui_label(r->obj, &sol_mono_12, COL_DIM, "");
+         lv_obj_align(r->right, LV_ALIGN_TOP_RIGHT, -4, 4);
++#if CONFIG_OS_TOUCH
++        ui_on_tap(r->obj, row_tap, l);
++#endif
+     }
++#if CONFIG_OS_TOUCH
++    ui_tap_key(l->box, OS_KEY_NONE);    // below the last row: nothing
++#endif
+ 
+     l->scroll = lv_obj_create(l->box);
+     lv_obj_remove_style_all(l->scroll);
+@@ -256,13 +335,25 @@ void ui_list_refresh(ui_list_t *l)
+         bool sel = idx == l->sel;
+         lv_obj_set_style_bg_opa(r->obj, sel ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+         lv_obj_set_hidden(r->mark, !sel);
++        if (row.icon && !r->icon) {
++            r->icon = lv_image_create(r->obj);
++            lv_obj_set_pos(r->icon, 8, (ROW_H - UI_ROW_ICON) / 2);
++        }
++        if (r->icon) {
++            lv_image_set_src(r->icon, row.icon);
++            lv_obj_set_hidden(r->icon, !row.icon);
++        }
++        int indent = row.icon ? UI_ROW_ICON + 4 : 0;
++        lv_obj_set_x(r->title, 10 + indent);
++        lv_obj_set_x(r->sub, 10 + indent);
++        lv_obj_set_width(r->sub, l->w - 20 - indent);
+         lv_label_set_text(r->title, row.title);
+         lv_obj_set_style_text_color(r->title, ui_col(row.title_color ? row.title_color : COL_TEXT), 0);
+         lv_label_set_text(r->sub, row.sub);
+         lv_label_set_text(r->right, row.right);
+         lv_obj_set_style_text_color(r->right, ui_col(row.right_color ? row.right_color : COL_DIM), 0);
+         // Keep the title clear of the right-hand label.
+-        lv_obj_set_width(r->title, l->w - 26 - (row.right[0] ? lv_obj_get_width(r->right) + 8 : 0));
++        lv_obj_set_width(r->title, l->w - 26 - indent - (row.right[0] ? lv_obj_get_width(r->right) + 8 : 0));
+     }
+ 
+     lv_obj_set_hidden(l->empty, l->count > 0);
+@@ -329,7 +420,8 @@ void ui_list_show(ui_list_t *l, bool show)
+ #define KB_ROWS     4
+ #define KB_FN_ROW   KB_ROWS
+ #define KB_FN_COUNT 5
+-#define KB_MAX      64
++#define KB_MAX      200             // a pump.fun description or URI
++#define KB_SHOWN    34              // characters the field shows: longer text shows its end
+ 
+ enum { FN_CASE, FN_MODE, FN_SPACE, FN_DEL, FN_OK };
+ 
+@@ -373,14 +465,42 @@ static void kb_render(ui_kb_t *kb)
+ {
+     int id = kb->row == KB_FN_ROW ? KB_ROWS * KB_COLS + kb->col : kb->row * KB_COLS + kb->col;
+     lv_buttonmatrix_set_selected_button(kb->btnm, id);
+-    lv_label_set_text_fmt(kb->text, "%s_", kb->buf);
++    size_t n = strlen(kb->buf);
++    lv_label_set_text_fmt(kb->text, n > KB_SHOWN ? "...%s_" : "%s_", kb->buf + (n > KB_SHOWN ? n - KB_SHOWN + 3 : 0));
+ }
+ 
++// The keyboard on screen, for typing from the console (ui_kb_type).
++static ui_kb_t *s_kb_open;
++
+ static void kb_deleted(lv_event_t *e)
+ {
++    if (s_kb_open == lv_event_get_user_data(e)) {
++        s_kb_open = NULL;
++    }
+     lv_free(lv_event_get_user_data(e));
+ }
+ 
++#if CONFIG_OS_TOUCH
++// A tapped key: the cursor goes there, then SELECT types it.
++static void kb_tap(lv_event_t *e)
++{
++    ui_tap_t *t = lv_event_get_param(e);
++    ui_kb_t *kb = lv_event_get_user_data(e);
++    if (t->swipe) {
++        return;
++    }
++    lv_area_t a;
++    lv_obj_get_content_coords(kb->btnm, &a);
++    int row = LV_CLAMP(0, (t->p.y - a.y1) * (KB_ROWS + 1) / lv_area_get_height(&a), KB_FN_ROW);
++    int cols = row == KB_FN_ROW ? KB_FN_COUNT : KB_COLS;
++    kb->row = row;
++    kb->col = LV_CLAMP(0, (t->p.x - a.x1) * cols / lv_area_get_width(&a), cols - 1);
++    kb_render(kb);
++    ui_tap_add(t, OS_KEY_SELECT);
++    t->handled = true;
++}
++#endif
++
+ ui_kb_t *ui_kb_create(lv_obj_t *parent, const char *title, size_t max_len)
+ {
+     ui_kb_t *kb = lv_malloc_zeroed(sizeof(*kb));
+@@ -427,7 +547,12 @@ ui_kb_t *ui_kb_create(lv_obj_t *parent, const char *title, size_t max_len)
+ 
+     lv_obj_t *hint = ui_hint(kb->box, "SELECT type   CANCEL delete / close");
+     (void)hint;
++#if CONFIG_OS_TOUCH
++    ui_on_tap(kb->btnm, kb_tap, kb);
++    ui_tap_key(kb->box, OS_KEY_NONE);
++#endif
+     kb_render(kb);
++    s_kb_open = kb;
+     return kb;
+ }
+ 
+@@ -514,6 +639,46 @@ const char *ui_kb_text(const ui_kb_t *kb)
+     return kb->buf;
+ }
+ 
++bool ui_kb_is_open(void)
++{
++    return s_kb_open != NULL;
++}
++
++bool ui_kb_edit(const char *text, int erase)
++{
++    ui_kb_t *kb = s_kb_open;
++    if (!kb) {
++        return false;
++    }
++    for (size_t n = strlen(kb->buf); erase > 0 && n; erase--) {
++        kb->buf[--n] = 0;
++    }
++    for (; text && *text; text++) {
++        if (*text >= 0x20 && *text < 0x7f) {        // what the font draws
++            kb_type(kb, *text);
++        }
++    }
++    kb_render(kb);
++    return true;
++}
++
++bool ui_kb_finish(bool ok)
++{
++    ui_kb_t *kb = s_kb_open;
++    if (!kb) {
++        return false;
++    }
++    if (ok) {
++        kb->row = KB_FN_ROW;                        // on the OK key, then SELECT presses it
++        kb->col = FN_OK;
++    } else {
++        kb->buf[0] = 0;                             // empty, then BACK closes it
++    }
++    kb_render(kb);
++    os_inject_key(ok ? OS_KEY_SELECT : OS_KEY_BACK);
++    return true;
++}
++
+ void ui_kb_delete(ui_kb_t *kb)
+ {
+     lv_obj_delete(kb->box);     // frees kb via kb_deleted
+diff --git a/main/core/ui.h b/main/core/ui.h
+index 4a0bff4..f713c3a 100644
+--- a/main/core/ui.h
++++ b/main/core/ui.h
+@@ -41,6 +41,7 @@ typedef struct {
+     char right[20];
+     uint32_t title_color;   // 0 = default
+     uint32_t right_color;   // 0 = dim
++    const void *icon;       // an image left of title and sub, up to UI_ROW_ICON square; NULL = none
+ } ui_row_t;
+ 
+ typedef void (*ui_row_cb_t)(int index, ui_row_t *row, void *ctx);
+@@ -49,6 +50,7 @@ typedef struct ui_list ui_list_t;
+ ui_list_t *ui_list_create(lv_obj_t *parent, int y, int h, ui_row_cb_t cb, void *ctx);   // full width
+ ui_list_t *ui_list_create_at(lv_obj_t *parent, int x, int y, int w, int h, ui_row_cb_t cb, void *ctx);
+ // Rows are 36 px: title and sub are one line each and end in "..." when too long.
++#define UI_ROW_ICON 32
+ void ui_list_set_count(ui_list_t *l, int count);   // re-renders
+ void ui_list_refresh(ui_list_t *l);
+ void ui_list_set_empty(ui_list_t *l, const char *text);
+@@ -66,6 +68,36 @@ ui_kb_t *ui_kb_create(lv_obj_t *parent, const char *title, size_t max_len);
+ ui_kb_result_t ui_kb_key(ui_kb_t *kb, os_key_t key, bool repeat);
+ const char *ui_kb_text(const ui_kb_t *kb);
+ void ui_kb_delete(ui_kb_t *kb);
++// Typing into the keyboard on screen from elsewhere (the console's kb command;
++// OS task, LVGL lock held). false: no keyboard is open.
++bool ui_kb_is_open(void);
++bool ui_kb_edit(const char *text, int erase);  // erase characters, then type text (printable ASCII)
++bool ui_kb_finish(bool ok);                     // press OK, or close it empty
++
++#if CONFIG_OS_TOUCH
++// ---- Touch targets (core/os_touch.c) ----
++// A tap goes to the object under the finger as a ui_tap_event() event with a
++// ui_tap_t, then to each parent in turn until a handler sets handled; it
++// usually answers with keys, which then go to the app's on_key as if
++// pressed. A tap nobody handles is SELECT. A horizontal swipe is offered the
++// same way (swipe != 0), and unhandled it is LEFT or RIGHT.
++
++#define UI_TAP_KEYS     12
++
++typedef struct {
++    lv_point_t p;           // screen coordinates
++    int8_t swipe;           // 0: a tap; 1: swiped left (next), -1: swiped right (previous)
++    bool handled;
++    uint8_t n;
++    os_key_t keys[UI_TAP_KEYS];
++} ui_tap_t;
++
++uint32_t ui_tap_event(void);
++void ui_tap_add(ui_tap_t *t, os_key_t key);
++void ui_on_tap(lv_obj_t *obj, lv_event_cb_t cb, void *user_data);
++// Tapping obj presses key; OS_KEY_NONE: taps on it do nothing.
++void ui_tap_key(lv_obj_t *obj, os_key_t key);
++#endif
+ 
+ // ---- Amounts, categories, rarities (docs/HHGTS.md "One look") ----
+ // Same names and colours as the web. Amounts use sol_mono_12 or the
+diff --git a/main/lua/lua_cmd.c b/main/lua/lua_cmd.c
+index f303cb4..040cf48 100644
+--- a/main/lua/lua_cmd.c
++++ b/main/lua/lua_cmd.c
+@@ -5,10 +5,13 @@
+ //   lua put <id> <file> begin|<base64>|end
+ //   lua recv <id> <file> <bytes> <sha256>
+ //
+-// <file> is main.lua, app.json or a bundled path (docs/LUA_API.md
+-// "Console"). Writing or removing any of them deletes the store's compiled
++// <file> is main.lua, app.json, code.bin or a bundled path (docs/LUA_API.md
++// "Console"). Writing or removing app.json or a .lua file deletes the compiled
+ // code (code.bin), which would no longer match: the app then runs from its
+-// source. Nothing here can write code.bin. put copies a file a line at a time: begin starts it, each
++// source. code.bin itself can be sent last (tools/badge_put.py --code): it
++// runs only if app.json's "code" names its SHA-256 and this build's label,
++// like the store's. The console is the badge's owner at the USB port, who
++// can flash any firmware anyway, so a chunk from it is trusted. put copies a file a line at a time: begin starts it, each
+ // base64 line appends to it, end checks it and moves it into place. recv
+ // takes a whole file in one stream after its line, a block at a time when
+ // the badge asks for it, so the card is never written while the UART
+@@ -73,10 +76,14 @@ static int cmd_list(void)
+     return n < 0;
+ }
+ 
+-// The store's compiled code no longer matches the app's files.
+-static void drop_code(const char *id)
++// The compiled code no longer matches the app once its manifest or Lua changes.
++static void drop_code(const char *id, const char *file)
+ {
+     char rel[64], path[160];
++    size_t n = strlen(file);
++    if (strcmp(file, "app.json") && (n < 4 || strcmp(file + n - 4, ".lua"))) {
++        return;
++    }
+     lua_pkg_rel(rel, sizeof(rel), id, "code.bin");
+     os_data_path(path, sizeof(path), rel);
+     unlink(path);
+@@ -115,7 +122,7 @@ static int cmd_rm(const char *id, const char *file)
+             printf("can't remove %s/%s\n", id, file);
+             return 1;
+         }
+-        drop_code(id);
++        drop_code(id, file);
+         printf("removed %s/%s\n", id, file);
+         return 0;
+     }
+@@ -183,7 +190,7 @@ static const char *finish_file(const char *id, const char *file, const char *par
+     if (rename(part, path) != 0) {
+         return "can't write it to the card";
+     }
+-    drop_code(id);
++    drop_code(id, file);
+     return NULL;
+ }
+ 
+@@ -192,7 +199,7 @@ static int cmd_put(const char *id, const char *file, const char *arg)
+     char rel[128], part[176], path[160];
+     size_t max;
+     if (!lua_pkg_file_rel(rel, sizeof(rel), id, file, &max)) {
+-        printf("usage: lua put <id> <main.lua|app.json|bundled path> begin|<base64>|end\n");
++        printf("usage: lua put <id> <main.lua|app.json|code.bin|bundled path> begin|<base64>|end\n");
+         return 1;
+     }
+     const char *why = refusal(id);
+@@ -374,7 +381,7 @@ static int cmd_recv(const char *id, const char *file, const char *bytes, const c
+     char *end;
+     long n = strtol(bytes, &end, 10);
+     if (!lua_pkg_file_rel(rel, sizeof(rel), id, file, NULL) || end == bytes || *end || n < 0 || !parse_sha(sha, want)) {
+-        printf("usage: lua recv <id> <main.lua|app.json|bundled path> <bytes> <sha256>\n");
++        printf("usage: lua recv <id> <main.lua|app.json|code.bin|bundled path> <bytes> <sha256>\n");
+         return 1;
+     }
+     const char *why = receive(id, file, n, want);
+@@ -452,7 +459,7 @@ static int cmd_sums(const char *id)
+         printf("sums: no microSD card\n");
+         return 1;
+     }
+-    int n = sum_file(id, "main.lua") + sum_file(id, "app.json");
++    int n = sum_file(id, "main.lua") + sum_file(id, "app.json") + sum_file(id, "code.bin");
+     s_sub[0] = 0;
+     n += sum_dir(id, 1);
+     printf("sums: %d files\n", n);
+diff --git a/main/lua/lua_host.c b/main/lua/lua_host.c
+index 8e4bcdd..46dad04 100644
+--- a/main/lua/lua_host.c
++++ b/main/lua/lua_host.c
+@@ -473,27 +473,56 @@ static int run_main(lua_State *L)
+ 
+ static const char *const s_key_names[] = {"up", "down", "left", "right", "select", "back"};
+ 
+-static int key_cb(lua_State *L)
++static void run_key(lua_State *L, os_key_t key, bool repeat)
+ {
+-    lh_ev_t *ev = lua_touserdata(L, 1);
+     lh_t *s = lh_get(L);
+-    if (lh_ui_key(L, s, ev->key, ev->repeat)) {
+-        return 0;
++    if (lh_ui_key(L, s, key, repeat)) {
++        return;
+     }
+     bool handled = false;
+     lua_getglobal(L, "on_key");
+     if (lua_isfunction(L, -1)) {
+-        lua_pushstring(L, s_key_names[ev->key]);
+-        lua_pushboolean(L, ev->repeat);
++        lua_pushstring(L, s_key_names[key]);
++        lua_pushboolean(L, repeat);
+         lua_call(L, 2, 1);
+         handled = lua_toboolean(L, -1);
+     }
+-    if (!handled && ev->key == OS_KEY_BACK && !ev->repeat) {
++    if (!handled && key == OS_KEY_BACK && !repeat) {
+         s->exit_req = true;
+     }
++}
++
++static int key_cb(lua_State *L)
++{
++    lh_ev_t *ev = lua_touserdata(L, 1);
++    run_key(L, ev->key, ev->repeat);
+     return 0;
+ }
+ 
++#if CONFIG_OS_TOUCH
++// A tap no object on screen took: on_touch(x, y) if the script has it, and
++// SELECT unless that returned true. Decided here, on the Lua task.
++static int touch_cb(lua_State *L)
++{
++    lh_ev_t *ev = lua_touserdata(L, 1);
++    lh_t *s = lh_get(L);
++    if (s->modal || s->kb) {
++        return 0;                       // a dialog opened meanwhile
++    }
++    lua_getglobal(L, "on_touch");
++    if (lua_isfunction(L, -1)) {
++        lua_pushinteger(L, ev->x);
++        lua_pushinteger(L, ev->y);
++        lua_call(L, 2, 1);
++        if (lua_toboolean(L, -1)) {
++            return 0;
++        }
++    }
++    run_key(L, OS_KEY_SELECT, false);
++    return 0;
++}
++#endif
++
+ static int tick_cb(lua_State *L)
+ {
+     lua_getglobal(L, "on_tick");
+@@ -529,6 +558,11 @@ static void run_events(lh_t *s, const lh_ev_t *ev)
+         } else if (ev->kind == LH_EV_MEET) {
+             lh_meet_event(s, ev->data);
+         }
++#if CONFIG_OS_TOUCH
++        else if (ev->kind == LH_EV_TOUCH) {
++            lh_callback(s, touch_cb, (void *)ev);
++        }
++#endif
+     }
+     lh_calls_run(s);
+     lh_ws_run(s);
+@@ -717,6 +751,23 @@ static void lua_task(void *arg)
+ // ---------------------------------------------------------------------------
+ // The host app (OS task)
+ 
++#if CONFIG_OS_TOUCH
++// A tap that reached the app's area unanswered goes to the script.
++static void host_tap(lv_event_t *e)
++{
++    ui_tap_t *t = lv_event_get_param(e);
++    lh_t *s = lh_cur;
++    if (t->swipe || !s || s->failed || s->finished || !s->area) {
++        return;                         // the default: SELECT, LEFT or RIGHT
++    }
++    lv_area_t a;
++    lv_obj_get_coords(s->area, &a);
++    lh_ev_t ev = { .kind = LH_EV_TOUCH, .gen = s->gen, .x = t->p.x - a.x1, .y = t->p.y - a.y1 };
++    lh_post(&ev);
++    t->handled = true;
++}
++#endif
++
+ static void host_enter(lv_obj_t *root)
+ {
+     xSemaphoreTake(lh_mx, portMAX_DELAY);
+@@ -731,6 +782,9 @@ static void host_enter(lv_obj_t *root)
+     lv_obj_set_style_bg_opa(area, LV_OPA_COVER, 0);
+     lv_obj_set_style_bg_color(area, ui_col(COL_BG), 0);
+     lv_obj_set_scrollable(area, false);
++#if CONFIG_OS_TOUCH
++    ui_on_tap(area, host_tap, NULL);
++#endif
+ 
+     lh_t *s = pkg.id[0] && !busy ? calloc(1, sizeof(*s)) : NULL;
+     if (!s) {
+diff --git a/main/lua/lua_img.c b/main/lua/lua_img.c
+index 9c81dc9..df811d9 100644
+--- a/main/lua/lua_img.c
++++ b/main/lua/lua_img.c
+@@ -276,13 +276,39 @@ static lh_pix_t *load_gif(lua_State *L, lh_t *s, const char *rel, long size, con
+     return p;
+ }
+ 
++// A PNG or JPEG of any size as its middle square, size x size (opts.size).
++static lh_pix_t *load_thumb(lua_State *L, lh_t *s, const char *rel, int side, const char *what)
++{
++    if (side < 0 || side > OS_ROOT_H) {
++        luaL_error(L, "%s: size must be 1 to %d", what, OS_ROOT_H);
++    }
++    lh_pix_t *p = new_pix(L, what, side, side);
++    const char *err = lua_pkg_thumb(s->pkg.id, rel, side, p->px);
++    if (err) {
++        luaL_error(L, "%s: %s: %s", what, rel, err);
++    }
++    for (int i = 0; i < side * side; i++) {
++        p->px[i] = p->px[i] == LH_PX_CLEAR ? 0 : p->px[i];
++    }
++    return p;
++}
++
+ // The PNG or GIF (its first frame) at the bundled path in idx, pushed as pixels.
+-static lh_pix_t *load_file(lua_State *L, int idx, const char *what)
++static lh_pix_t *load_file(lua_State *L, int idx, int opts, const char *what)
+ {
+     lh_t *s = lh_get(L);
+     char rel[LUA_PKG_PATH_MAX + 1];
+     lh_fs_check_path(L, idx, rel);
+     lh_charge_steps(L, LH_FS_OPEN_STEPS);
++    int side = 0;
++    if (lua_type(L, opts) == LUA_TTABLE) {
++        lua_getfield(L, opts, "size");
++        side = lua_isnil(L, -1) ? 0 : (int)luaL_checkinteger(L, -1);
++        lua_pop(L, 1);
++    }
++    if (side) {
++        return load_thumb(L, s, rel, side, what);
++    }
+     long size;
+     FILE *f = lh_fs_fopen(s, rel, &size);
+     if (!f) {
+@@ -414,7 +440,7 @@ static lh_pix_t *to_pix(lua_State *L, int idx, int opts, const char *what)
+         return p;
+     }
+     switch (lua_type(L, idx)) {
+-    case LUA_TSTRING: return load_file(L, idx, what);
++    case LUA_TSTRING: return load_file(L, idx, opts, what);
+     case LUA_TTABLE: return load_art(L, idx, opts, what);
+     }
+     luaL_typeerror(L, idx, "image, PNG or GIF path, or table of rows");
+diff --git a/main/lua/lua_net.c b/main/lua/lua_net.c
+index b5037c6..cade12e 100644
+--- a/main/lua/lua_net.c
++++ b/main/lua/lua_net.c
+@@ -11,15 +11,25 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
++#include <sys/stat.h>
+ #include "cJSON.h"
+ #include "core/os_api.h"
+ #include "core/os_bridge.h"
+ #include "core/os_cloud.h"
++#include "core/os_data.h"
++#include "core/os_http.h"
+ #include "core/os_mesh.h"
+ #include "core/os_socket.h"
+ #include "core/os_wifi.h"
++#include "mbedtls/base64.h"
++#include "sol/sol.h"
++#include "wallet/wallet.h"
+ #include "lua_priv.h"
+ 
++int lh_sol_keypairs(const sol_keypair_t **out, int max);    // lua_sol.c
++
++#define CHAIN_RESP      8192            // chain.rpc answers: ask for what fits (dataSlice, limits)
++
+ typedef enum {
+     OP_BALANCE, OP_SPEND, OP_TRANSFER, OP_DEPOSIT, OP_AWARD,
+     OP_ITEMS, OP_GRANT, OP_UPDATE, OP_REMOVE,
+@@ -27,6 +37,8 @@ typedef enum {
+     OP_REPORT, OP_ACTIVE,
+     OP_HTTP, OP_RPC,
+     OP_MEETS,
++    OP_CHAIN, OP_SIGN,                  // straight to the RPC, and the wallet's signature
++    OP_IPFS,                            // a file to IPFS (method: its filename, path: the file or "")
+ } op_t;
+ 
+ // Permission per op, and the field of the answer the callback gets (NULL = all of it).
+@@ -43,6 +55,8 @@ static const struct {
+     [OP_REPORT] = {LUA_PERM_QUEST, NULL}, [OP_ACTIVE] = {LUA_PERM_QUEST, "items"},
+     [OP_HTTP] = {LUA_PERM_HTTP, NULL}, [OP_RPC] = {LUA_PERM_RPC, "result"},
+     [OP_MEETS] = {LUA_PERM_MESH, NULL},
++    [OP_CHAIN] = {LUA_PERM_CHAIN, "result"}, [OP_SIGN] = {LUA_PERM_WALLET, NULL},
++    [OP_IPFS] = {LUA_PERM_IPFS, "Hash"},
+ };
+ 
+ static uint32_t s_token;
+@@ -90,9 +104,74 @@ static void finish(lh_call_t *c, const char *err)
+     xSemaphoreGive(lh_mx);
+ }
+ 
++// wallet.sign, approved: sign the message (base64 in c->req) with the wallet and
++// this run's throwaway keypairs. No network; done at once. Lua task.
++static void sign_now(lh_call_t *c)
++{
++    static uint8_t msg[SOL_TX_V1_MAX], wire[SOL_TX_V1_MAX], sig0[64];
++    size_t n = 0;
++    const char *err = NULL;
++    sol_keypair_t *kp = calloc(1, sizeof(*kp));
++    const sol_keypair_t *kps[5] = {kp};
++    int nk = 1 + lh_sol_keypairs(kps + 1, 4);
++    if (!kp) {
++        err = "busy";
++    } else if (!wallet_keypair(kp)) {
++        err = "no wallet";
++    } else if (mbedtls_base64_decode(msg, sizeof(msg), &n, (const unsigned char *)c->req, strlen(c->req)) || !n) {
++        err = "bad message";
++    } else if (!(n = sol_msg_sign(msg, n, kps, nk, wire, sizeof(wire), sig0))) {
++        err = "a signer isn't this wallet or one of its keypairs";
++    }
++    if (kp) {
++        memset(kp, 0, sizeof(*kp));
++        free(kp);
++    }
++    char *body = NULL;
++    if (!err) {
++        size_t blen = 0;
++        char sig[SOL_B58_SIG];
++        sol_b58_encode(sig0, 64, sig, sizeof(sig));
++        body = malloc(SOL_TX_V1_MAX * 4 / 3 + 128);
++        if (body) {
++            size_t o = (size_t)sprintf(body, "{\"signature\":\"%s\",\"tx\":\"", sig);
++            mbedtls_base64_encode((unsigned char *)body + o, SOL_TX_V1_MAX * 4 / 3 + 8, &blen, wire, n);
++            strcpy(body + o + blen, "\"}");
++        } else {
++            err = "busy";
++        }
++    }
++    xSemaphoreTake(lh_mx, portMAX_DELAY);
++    c->err = err;
++    c->status = err ? 0 : 200;
++    c->body = body;
++    c->done = true;
++    xSemaphoreGive(lh_mx);
++}
++
+ static void send(lh_call_t *c)
+ {
+-    esp_err_t e = os_api_call(c->method, c->path, c->req, 0, api_cb, c->ctx);
++    if (c->op == OP_SIGN) {
++        sign_now(c);
++        free(c->method);
++        free(c->path);
++        free(c->req);
++        c->method = c->path = c->req = NULL;
++        return;
++    }
++    esp_err_t e;
++    if (c->op == OP_IPFS) {
++        char key[WALLET_IPFS_KEY_MAX + 1], url[WALLET_RPC_MAX + 1];
++        wallet_ipfs_key(key, sizeof(key));
++        wallet_ipfs_url(url, sizeof(url));
++        e = os_api_upload(url, key[0] ? key : NULL, c->path[0] ? c->path : NULL, c->req,
++                          c->req ? strlen(c->req) : 0, c->method, 1024, api_cb, c->ctx);
++        memset(key, 0, sizeof(key));
++    } else if (c->op == OP_CHAIN) {
++        e = os_api_fetch(c->method, c->path, c->req, CHAIN_RESP, api_cb, c->ctx);
++    } else {
++        e = os_api_call(c->method, c->path, c->req, 0, api_cb, c->ctx);
++    }
+     free(c->method);
+     free(c->path);
+     free(c->req);
+@@ -172,7 +251,14 @@ static int start_ex(lua_State *L, op_t op, const char *method, const char *path,
+     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+     // No Lua errors from here on: C memory is in play.
+     lh_jbuf_t b = { .max = OS_API_RESP_DEFAULT };
+-    bool body_ok = !body_idx || lh_json_encode(L, body_idx, &b);
++    bool body_ok;
++    if (body_idx && lua_type(L, body_idx) == LUA_TSTRING) {
++        b.p = strdup(lua_tostring(L, body_idx));    // already encoded (wallet.sign's base64 message)
++        body_ok = b.p != NULL;
++        b.err = "busy";
++    } else {
++        body_ok = !body_idx || lh_json_encode(L, body_idx, &b);
++    }
+     lh_call_t *c = calloc(1, sizeof(*c));
+     if (!c) {
+         free(b.p);
+@@ -190,11 +276,14 @@ static int start_ex(lua_State *L, op_t op, const char *method, const char *path,
+     *pp = c;
+     xSemaphoreGive(lh_mx);
+ 
++    bool local = op == OP_SIGN, chain = op == OP_CHAIN || op == OP_IPFS;    // chain: Wi-Fi is enough
+     const char *err = !(s->pkg.perms & s_ops[op].perm) ? "denied"
+                     : fail ? fail
+                     : !body_ok ? (strcmp(b.err, "too big") ? b.err : "request too big")
+                     : n >= LH_CALLS_MAX || (confirm && os_confirm_open()) ? "busy"
++                    : local ? NULL
+                     : lh_ws_busy(s) || os_socket_active() ? "socket open"
++                    : chain ? (os_wifi_state() != OS_WIFI_CONNECTED ? "offline" : NULL)
+                     : !os_api_online() ? "offline" : NULL;
+     if (!err) {
+         c->method = strdup(method);
+@@ -253,11 +342,69 @@ static void push_error(lua_State *L, lh_call_t *c)
+     lua_pushstring(L, msg);
+ }
+ 
++// A copy of JSON with every integer beyond Lua's 32 bits in quotes ("5000000000"):
++// this badge's Lua has 32-bit integers and floats. NULL: no memory (use it as is).
++static char *quote_big_ints(const char *in)
++{
++    size_t len = strlen(in);
++    char *out = malloc(len + len / 4 + 16), *o = out;
++    size_t room = len + len / 4 + 15;
++    bool str = false, esc = false;
++    if (!out) {
++        return NULL;
++    }
++    for (const char *p = in; *p;) {
++        if (str) {
++            str = esc || *p != '"';
++            esc = !esc && *p == '\\';
++            *o++ = *p++;
++            continue;
++        }
++        if (*p == '"') {
++            str = true;
++            *o++ = *p++;
++            continue;
++        }
++        if ((*p == '-' || (*p >= '0' && *p <= '9'))) {
++            const char *q = p + (*p == '-');
++            while (*q >= '0' && *q <= '9') {
++                q++;
++            }
++            bool integer = *q != '.' && *q != 'e' && *q != 'E';
++            size_t digits = (size_t)(q - p) - (*p == '-');
++            bool big = integer && (digits > 10 || (digits == 10 && strncmp(p + (*p == '-'), "2147483647", 10) > 0));
++            size_t n = (size_t)(q - p);
++            if (big && (size_t)(o - out) + n + 2 <= room) {
++                *o++ = '"';
++                memcpy(o, p, n);
++                o += n;
++                *o++ = '"';
++                p = q;
++                continue;
++            }
++            memcpy(o, p, n);
++            o += n;
++            p = q;
++            continue;
++        }
++        *o++ = *p++;
++    }
++    *o = 0;
++    return out;
++}
++
+ // Protected: builds cb(ok, result) for a finished call and runs it.
+ static int deliver(lua_State *L)
+ {
+     lh_call_t *c = lua_touserdata(L, 1);
+     lua_rawgeti(L, LUA_REGISTRYINDEX, c->cb_ref);
++    if (c->op == OP_CHAIN && c->body && !c->err) {
++        char *q = quote_big_ints(c->body);      // as the badge server does for rpc.call
++        if (q) {
++            free(c->body);
++            c->body = q;
++        }
++    }
+     if (c->err || c->status < 200 || c->status > 299) {
+         push_error(L, c);
+     } else if (lh_json_decode(L, c->body ? c->body : "", c->body ? strlen(c->body) : 0)) {
+@@ -265,10 +412,37 @@ static int deliver(lua_State *L)
+         lua_pushliteral(L, "bad answer from the server");
+     } else {
+         const char *field = s_ops[c->op].field;
++        bool rpc_error = false;
++        if (c->op == OP_CHAIN && lua_istable(L, -1)) {
++            rpc_error = lua_getfield(L, -1, "error") == LUA_TTABLE;
++            if (!rpc_error) {
++                lua_pop(L, 1);
++            }
++        }
++        if (rpc_error) {
++            // JSON-RPC's {"error": {"code", "message", "data"}}, on HTTP 200
++            lua_getfield(L, -1, "code");
++            lua_getfield(L, -2, "message");
++            char why[128];
++            snprintf(why, sizeof(why), "rpc %s: %s", lua_tostring(L, -2) ? lua_tostring(L, -2) : "?",
++                     lua_tostring(L, -1) ? lua_tostring(L, -1) : "error");
++            lua_pop(L, 4);
++            lua_pushboolean(L, 0);
++            lua_pushstring(L, why);
++            lua_call(L, 2, 0);
++            return 0;
++        }
+         if (field && lua_istable(L, -1)) {
+             lua_getfield(L, -1, field);
+             lua_remove(L, -2);
+         }
++        if (c->op == OP_IPFS && lua_type(L, -1) != LUA_TSTRING) {
++            lua_pop(L, 1);
++            lua_pushboolean(L, 0);
++            lua_pushliteral(L, "no CID in the answer");
++            lua_call(L, 2, 0);
++            return 0;
++        }
+         lua_pushboolean(L, 1);
+         lua_insert(L, -2);
+     }
+@@ -324,6 +498,7 @@ void lh_net_stop(lh_t *s)
+     xSemaphoreGive(lh_mx);
+     lh_ws_stop(s);
+     lh_mesh_stop();
++    lh_sol_stop();
+ }
+ 
+ void lh_calls_free(lh_t *s)
+@@ -1042,8 +1217,133 @@ static int l_mesh_bridge(lua_State *L)
+     return 0;
+ }
+ 
++// wallet.sign(message, prompt, cb): cb(true, {signature=, tx=base64}) once the
++// owner approves in the OS's dialog (the script can't press it), or cb(false,
++// "denied" | "no wallet" | ...). message: binary (sol.message).
++static int l_wallet_sign(lua_State *L)
++{
++    size_t n = 0;
++    const char *msg = luaL_checklstring(L, 1, &n);
++    const char *prompt = luaL_checkstring(L, 2);
++    luaL_checktype(L, 3, LUA_TFUNCTION);
++    luaL_argcheck(L, n > 0 && n <= SOL_TX_V1_MAX, 1, "a message up to 4096 bytes");
++    sol_pubkey_t signers[8];
++    luaL_argcheck(L, sol_msg_signers((const uint8_t *)msg, n, signers, 8) > 0, 1, "not a Solana message");
++
++    lh_t *s = lh_get(L);
++    char question[220], addr[SOL_B58_PUBKEY];
++    sol_pubkey_str(&signers[0], addr);
++    snprintf(question, sizeof(question), "%s asks your wallet to sign on %s:\n%.100s\nfee payer %.6s...%s",
++             s->pkg.name, wallet_cluster(), prompt, addr, addr + strlen(addr) - 4);
++
++    char *b64 = malloc(SOL_TX_V1_MAX * 4 / 3 + 8);
++    size_t blen = 0;
++    if (!b64) {
++        return luaL_error(L, "not enough memory");
++    }
++    mbedtls_base64_encode((unsigned char *)b64, SOL_TX_V1_MAX * 4 / 3 + 8, &blen, (const unsigned char *)msg, n);
++    lua_pushstring(L, b64);                 // a string body goes as it is (start_ex)
++    free(b64);
++    return start(L, OP_SIGN, "SIGN", "-", lua_gettop(L), 3, question);
++}
++
++// chain.rpc(method, [params], [{url=}], cb): Solana JSON-RPC to the RPC set
++// with "wallet rpc", or to url (https, a block engine say), straight from the
++// badge. cb(true, result) or cb(false, why); integers past 32 bits arrive as strings.
++static int l_chain_rpc(lua_State *L)
++{
++    int top = lua_gettop(L);
++    luaL_argcheck(L, top >= 2 && top <= 4 && lua_isfunction(L, top), top < 2 ? 2 : top,
++                  "chain.rpc(method, [params], [opts], cb)");
++    const char *method = luaL_checkstring(L, 1);
++    int params = top >= 3 && !lua_isnil(L, 2) ? 2 : 0;
++    luaL_argcheck(L, !params || lua_istable(L, params), 2, "params are a table");
++    char url[WALLET_RPC_MAX + 1];
++    wallet_rpc_url(url, sizeof(url));
++    if (top == 4 && !lua_isnil(L, 3)) {
++        luaL_checktype(L, 3, LUA_TTABLE);
++        lua_getfield(L, 3, "url");
++        size_t n = 0;
++        const char *u = lua_tolstring(L, -1, &n);
++        luaL_argcheck(L, u && n <= WALLET_RPC_MAX && !strncmp(u, "https://", 8), 3, "url: https://, up to 200 characters");
++        memcpy(url, u, n + 1);
++        lua_pop(L, 1);
++    }
++    lua_createtable(L, 0, 4);
++    lua_pushliteral(L, "2.0");
++    lua_setfield(L, -2, "jsonrpc");
++    lua_pushinteger(L, 1);
++    lua_setfield(L, -2, "id");
++    lua_pushstring(L, method);
++    lua_setfield(L, -2, "method");
++    if (params) {
++        lua_pushvalue(L, params);
++        lua_setfield(L, -2, "params");
++    }
++    return start(L, OP_CHAIN, "POST", url, lua_gettop(L), top, NULL);
++}
++
++// ipfs.add(file, cb) or ipfs.add({name=, data=}, cb): one of the app's bundled
++// files (streamed from the card, up to 2 MB), or up to 4 KB of text, uploaded
++// with the key set by the console's "wallet ipfs key" (Filebase by default).
++// cb(true, cid) or cb(false, why). The key never reaches Lua.
++#define IPFS_DATA_MAX   4096
++
++static int l_ipfs_add(lua_State *L)
++{
++    lh_t *s = lh_get(L);
++    luaL_checktype(L, 2, LUA_TFUNCTION);
++    char file[160] = "", name[LUA_PKG_PATH_MAX + 1];
++    const char *fail = NULL;
++    int body = 0;
++    if (lua_istable(L, 1)) {
++        lua_getfield(L, 1, "name");
++        strlcpy(name, luaL_optstring(L, -1, "data.json"), sizeof(name));
++        lua_getfield(L, 1, "data");
++        size_t n;
++        const char *d = luaL_checklstring(L, -1, &n);
++        luaL_argcheck(L, n > 0 && n <= IPFS_DATA_MAX && strlen(d) == n, 1, "data: 1 to 4096 bytes of text");
++        body = lua_gettop(L);
++    } else {
++        size_t n;
++        const char *rel = luaL_checklstring(L, 1, &n);
++        luaL_argcheck(L, n <= LUA_PKG_PATH_MAX && lua_pkg_valid_path(rel), 1, "a bundled file's path");
++        char r[24 + LUA_PKG_ID_MAX + LUA_PKG_PATH_MAX];
++        snprintf(r, sizeof(r), "apps/%s/files/%s", s->pkg.id, rel);
++        os_data_path(file, sizeof(file), r);
++        const char *slash = strrchr(rel, '/');
++        strlcpy(name, slash ? slash + 1 : rel, sizeof(name));
++        struct stat st;
++        fail = stat(file, &st) != 0 || !S_ISREG(st.st_mode) ? "not found"
++             : st.st_size > OS_HTTP_UPLOAD_MAX ? "file over 2 MB" : NULL;
++    }
++    luaL_argcheck(L, lua_pkg_valid_path(name) && !strchr(name, '/'), 1, "name: a plain lowercase filename");
++    char key[WALLET_IPFS_KEY_MAX + 1];
++    if (!fail && !wallet_ipfs_key(key, sizeof(key))) {
++        fail = "no IPFS key: wallet ipfs key <token> on the console";
++    }
++    memset(key, 0, sizeof(key));
++    return start_ex(L, OP_IPFS, name, file, body, 2, NULL, fail);
++}
++
++// ipfs.ready() -> true when an upload key is set
++static int l_ipfs_ready(lua_State *L)
++{
++    lh_need_perm(L, LUA_PERM_IPFS, "ipfs");
++    char key[WALLET_IPFS_KEY_MAX + 1];
++    lua_pushboolean(L, wallet_ipfs_key(key, sizeof(key)));
++    memset(key, 0, sizeof(key));
++    return 1;
++}
++
+ void lh_open_net(lua_State *L)
+ {
++    static const luaL_Reg ipfs[] = {{"add", l_ipfs_add}, {"ready", l_ipfs_ready}, {NULL, NULL}};
++    luaL_newlib(L, ipfs);
++    lua_setglobal(L, "ipfs");
++    static const luaL_Reg wallet[] = {{"sign", l_wallet_sign}, {NULL, NULL}};
++    static const luaL_Reg chain[] = {{"rpc", l_chain_rpc}, {NULL, NULL}};
++    lh_open_sol(L, wallet, chain);
+     static const luaL_Reg lamps[] = {
+         {"balance", l_balance}, {"spend", l_spend}, {"transfer", l_transfer}, {"deposit", l_deposit},
+         {"award", l_award}, {NULL, NULL},
+diff --git a/main/lua/lua_pkg.c b/main/lua/lua_pkg.c
+index 19aeaa4..5ad45d6 100644
+--- a/main/lua/lua_pkg.c
++++ b/main/lua/lua_pkg.c
+@@ -11,6 +11,7 @@
+ #include "psa/crypto.h"
+ #include "core/os_cloud.h"
+ #include "core/os_data.h"
++#include "img/thumb.h"
+ #include "lua_install.h"
+ #include "lua_pkg.h"
+ #include "vendor/lua.h"
+@@ -18,7 +19,7 @@
+ #define HASH_CHUNK  1024
+ 
+ static const char *const s_perm_names[LUA_PERM_COUNT] = {
+-    "led", "wifi", "mesh", "lamps", "items", "profile", "quest", "http", "rpc", "ble",
++    "led", "wifi", "mesh", "lamps", "items", "profile", "quest", "http", "rpc", "ble", "wallet", "chain", "ipfs",
+ };
+ 
+ static const char *const s_perm_texts[LUA_PERM_COUNT] = {
+@@ -32,6 +33,9 @@ static const char *const s_perm_texts[LUA_PERM_COUNT] = {
+     "Talk to servers on the internet",
+     "Read and send to Solana",
+     "Talk to Bluetooth devices",
++    "Ask your wallet to sign",
++    "Talk to your Solana RPC",
++    "Upload files to IPFS with your key",
+ };
+ 
+ const char *lua_perm_name(int i)
+@@ -109,6 +113,44 @@ const char *lua_pkg_symbol(const char *icon)
+     return LV_SYMBOL_PLAY;
+ }
+ 
++// The name has the picture's file size in it, so a replaced picture gets a new one.
++const char *lua_pkg_thumb(const char *id, const char *file, int side, uint16_t *px)
++{
++    char rel[160], src[160], path[160];
++    struct stat st;
++    if (!lua_pkg_valid_id(id) || !lua_pkg_valid_path(file)) {
++        return "not found";
++    }
++    snprintf(rel, sizeof(rel), "apps/%s/files/%s", id, file);
++    os_data_path(src, sizeof(src), rel);
++    if (stat(src, &st) != 0) {
++        return "not found";
++    }
++    char flat[LUA_PKG_PATH_MAX + 1];
++    strlcpy(flat, file, sizeof(flat));
++    for (char *c = flat; *c; c++) {
++        *c = *c == '/' ? '_' : *c;
++    }
++    snprintf(rel, sizeof(rel), "apps/%s/thumbs/%s-%ld-%d.bin", id, flat, (long)st.st_size, side);
++    os_data_path(path, sizeof(path), rel);
++    const char *why = NULL;
++    if (stat(path, &st) != 0) {
++        os_data_mkdirs(rel);
++        why = img_thumb(src, path, side);
++    }
++    if (why || !px) {
++        return why;
++    }
++    FILE *f = fopen(path, "rb");
++    lv_image_header_t h;
++    bool ok = f && fread(&h, 1, sizeof(h), f) == sizeof(h) && h.w == side && h.h == side &&
++              fread(px, 2, (size_t)side * side, f) == (size_t)side * side;
++    if (f) {
++        fclose(f);
++    }
++    return ok ? NULL : "can't read the thumbnail";
++}
++
+ void lua_pkg_plain(char *out, size_t n, const char *in)
+ {
+     size_t o = 0;
+@@ -172,10 +214,10 @@ bool lua_pkg_file_rel(char *rel, size_t n, const char *id, const char *file, siz
+     if (!lua_pkg_valid_id(id) || !file) {
+         return false;
+     }
+-    if (!strcmp(file, "main.lua") || !strcmp(file, "app.json")) {
++    if (!strcmp(file, "main.lua") || !strcmp(file, "app.json") || !strcmp(file, "code.bin")) {
+         lua_pkg_rel(rel, n, id, file);
+         if (max) {
+-            *max = file[0] == 'm' ? LUA_PKG_SRC_MAX : LUA_PKG_JSON_MAX;
++            *max = file[0] == 'm' ? LUA_PKG_SRC_MAX : file[0] == 'a' ? LUA_PKG_JSON_MAX : LUA_PKG_CODE_MAX;
+         }
+         return true;
+     }
+@@ -289,6 +331,10 @@ bool lua_pkg_parse(const char *json, const char *want_id, lua_pkg_t *out)
+     copy_str(m, "category", out->category, sizeof(out->category));
+     const cJSON *icon = cJSON_GetObjectItemCaseSensitive(m, "icon");
+     out->symbol = lua_pkg_symbol(cJSON_IsString(icon) ? icon->valuestring : NULL);
++    const cJSON *icon_image = cJSON_GetObjectItemCaseSensitive(m, "icon_image");
++    if (cJSON_IsString(icon_image) && lua_pkg_valid_path(icon_image->valuestring)) {
++        strlcpy(out->icon_image, icon_image->valuestring, sizeof(out->icon_image));
++    }
+     const cJSON *accent = cJSON_GetObjectItemCaseSensitive(m, "accent");
+     out->accent = cJSON_IsString(accent) ? strtoul(accent->valuestring, NULL, 16) & 0xFFFFFF : 0xB6B0FF;
+     const cJSON *perm;
+diff --git a/main/lua/lua_pkg.h b/main/lua/lua_pkg.h
+index 863e382..12a5053 100644
+--- a/main/lua/lua_pkg.h
++++ b/main/lua/lua_pkg.h
+@@ -35,9 +35,12 @@ typedef enum {
+     LUA_PERM_HTTP = 1 << 7,
+     LUA_PERM_RPC = 1 << 8,
+     LUA_PERM_BLE = 1 << 9,
++    LUA_PERM_WALLET = 1 << 10,      // the badge's own wallet (wallet.h)
++    LUA_PERM_CHAIN = 1 << 11,       // Solana RPC straight from the badge
++    LUA_PERM_IPFS = 1 << 12,        // upload a bundled file to IPFS with the owner's key
+ } lua_perm_t;
+ 
+-#define LUA_PERM_COUNT  10
++#define LUA_PERM_COUNT  13
+ 
+ typedef struct {
+     char id[LUA_PKG_ID_MAX + 1];
+@@ -47,6 +50,7 @@ typedef struct {
+     char summary[81];
+     char category[8];
+     const char *symbol;     // LV_SYMBOL_* for the manifest's icon
++    char icon_image[LUA_PKG_PATH_MAX + 1];  // a bundled PNG or JPEG, "" = none
+     uint32_t accent;        // 0xRRGGBB
+     uint32_t perms;         // lua_perm_t bits
+     int files;              // bundled files, as the manifest says
+@@ -117,13 +121,18 @@ void lua_pkg_hosts_line(const struct cJSON *hosts, char *out, size_t n);
+ // The same from apps/<id>/app.json (a small file read). false without any.
+ bool lua_pkg_hosts(const char *id, char *out, size_t n);
+ 
+-// Permission names: "led" ... "ble", and a plain-words description.
++// Permission names: "led" ... "ipfs", and a plain-words description.
+ const char *lua_perm_name(int bit_index);
+ const char *lua_perm_text(int bit_index);
+ uint32_t lua_perm_parse(const char *name);     // 0 if unknown
+ 
+ const char *lua_pkg_symbol(const char *icon);  // LV_SYMBOL_* (never NULL)
+ 
++// A bundled PNG or JPEG's middle square as side x side RGB565, made the first
++// time (blocking) and kept in apps/<id>/thumbs/: its pixels into px, unless
++// px is NULL. NULL, or why not ("not found" when there's no such file).
++const char *lua_pkg_thumb(const char *id, const char *file, int side, uint16_t *px);
++
+ // App-supplied text for an OS confirm dialog: printable ASCII only, cut to
+ // fit, so it can't add lines or restructure the question.
+ void lua_pkg_plain(char *out, size_t n, const char *in);
+diff --git a/main/lua/lua_priv.h b/main/lua/lua_priv.h
+index f70dba4..98c4c03 100644
+--- a/main/lua/lua_priv.h
++++ b/main/lua/lua_priv.h
+@@ -235,7 +235,7 @@ typedef struct {
+ extern lh_stats_t lh_stats;
+ 
+ // Events for the Lua task.
+-typedef enum { LH_EV_KEY, LH_EV_WAKE, LH_EV_MESH, LH_EV_MEET, LH_EV_QUIT } lh_ev_kind_t;
++typedef enum { LH_EV_KEY, LH_EV_WAKE, LH_EV_MESH, LH_EV_MEET, LH_EV_QUIT, LH_EV_TOUCH } lh_ev_kind_t;
+ 
+ typedef struct {
+     uint8_t kind;
+@@ -243,6 +243,9 @@ typedef struct {
+     bool repeat;
+     uint32_t gen;
+     char *data;                 // LH_EV_MESH, LH_EV_MEET: "<from id>\0<json>", freed by the receiver
++#if CONFIG_OS_TOUCH
++    int16_t x, y;               // LH_EV_TOUCH: a tap in app coordinates
++#endif
+ } lh_ev_t;
+ 
+ extern SemaphoreHandle_t lh_mx;     // guards call records, the mesh filter, lh_cur
+@@ -340,6 +343,11 @@ void lh_ble_init(lh_t *s);                              // at launch: no refs ye
+ void lh_ble_run(lh_t *s);                               // Lua task: owed callbacks and os_ble's events
+ void lh_ble_stop(lh_t *s);                              // any task: the app stops, Bluetooth goes off
+ 
++// lua_sol.c: sol, wallet, chain. lh_open_net opens them with its own
++// wallet.sign and chain.rpc, which use the call records.
++void lh_open_sol(lua_State *L, const luaL_Reg *wallet_extra, const luaL_Reg *chain_extra);
++void lh_sol_stop(void);                                 // forget this run's keypairs
++
+ // lua_net.c: mesh, lamps, items, profile, quest, http
+ void lh_open_net(lua_State *L);
+ void lh_calls_run(lh_t *s);                             // answer finished calls
+diff --git a/main/lua/lua_ui.c b/main/lua/lua_ui.c
+index e8a2b8b..ee2df13 100644
+--- a/main/lua/lua_ui.c
++++ b/main/lua/lua_ui.c
+@@ -716,8 +716,19 @@ static int l_confirm(lua_State *L)
+     lv_obj_set_style_border_color(p, ui_col(COL_PURPLE), 0);
+     lv_obj_t *t = ui_label(p, &sol_font_14, COL_TEXT, text);
+     lv_obj_set_width(t, OS_ROOT_W - 66);
++#if CONFIG_OS_TOUCH
++    // The hint's two halves are its tap targets; elsewhere a tap does nothing.
++    lv_obj_t *k = ui_label(p, &sol_mono_12, COL_DIM, "SELECT yes");
++    lv_obj_align_to(k, t, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
++    lv_obj_t *no = ui_label(p, &sol_mono_12, COL_DIM, "CANCEL no");
++    lv_obj_align_to(no, k, LV_ALIGN_OUT_RIGHT_MID, 24, 0);
++    ui_tap_key(k, OS_KEY_SELECT);
++    ui_tap_key(no, OS_KEY_BACK);
++    ui_tap_key(dim, OS_KEY_NONE);
++#else
+     lv_obj_t *k = ui_label(p, &sol_mono_12, COL_DIM, "SELECT yes   CANCEL no");
+     lv_obj_align_to(k, t, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
++#endif
+     lv_obj_center(p);
+     s->modal = dim;
+     return 0;
+diff --git a/main/sources.cmake b/main/sources.cmake
+index d5c6dbc..27a2bfd 100644
+--- a/main/sources.cmake
++++ b/main/sources.cmake
+@@ -31,6 +31,7 @@ set(SOLANA_OS_SRCS
+     lua/lua_host.c lua/lua_ui.c lua/lua_sys.c lua/lua_net.c lua/lua_json.c lua/lua_pkg.c lua/lua_cmd.c
+     lua/lua_fs.c lua/lua_install.c lua/lua_code.c lua/lua_ws.c lua/lua_img.c lua/lua_png.c lua/lua_gif.c lua/lua_meet.c
+     lua/lua_ble.c
++    lua/lua_sol.c sol/sol.c sol/vendor/tweetnacl.c wallet/wallet.c kb/kb_cmd.c img/thumb.c img/vendor/miniz_tinfl.c img/vendor/tjpgd.c
+     ${SOLANA_OS_LUA_VENDOR_SRCS}
+     assets/sol_mono_12.c assets/sol_font_14.c assets/sol_font_20.c assets/sol_font_32.c
+     assets/img_logomark_16.c assets/img_logomark_40.c assets/img_logomark_72.c
+@@ -48,3 +49,8 @@ set(SOLANA_OS_DEVICE_SRCS
+     core/console.c
+     lua/lua_xip.c
+ )
++
++# Touch input, only on boards with a touch panel (never in the emulator).
++if(CONFIG_OS_TOUCH)
++    list(APPEND SOLANA_OS_DEVICE_SRCS core/os_touch.c core/touchcal.c)
++endif()
+diff --git a/components/bsp/Kconfig b/components/bsp/Kconfig
+new file mode 100644
+index 0000000..ba9112a
+--- /dev/null
++++ b/components/bsp/Kconfig
+@@ -0,0 +1,54 @@
++menu "Badge board"
++
++    config BSP_BOARD_DIY
++        bool "Breadboard build: an ESP32-C5 dev board instead of the badge"
++        default n
++        help
++            For a homemade badge: an ESP32-C5 dev board with an ILI9341 SPI
++            display (CS on GPIO1), a microSD on the display's SD header (or
++            none, see BSP_SD_INTERNAL_FLASH), and six
++            buttons wired from GPIO 2, 5, 23, 24, 25, 26 to GND (Up, Left,
++            Right, Down, Select, Back) instead of the TCA9534 expander. No
++            battery: it reports USB power. Console commands also work on the
++            board's native USB port. Build with sdkconfig.diy (see its header).
++
++    config BSP_SD_INTERNAL_FLASH
++        bool "No microSD: keep /sdcard in the internal flash"
++        depends on BSP_BOARD_DIY
++        default n
++        help
++            Mount a wear-levelled FAT volume from the internal flash's "appfs"
++            partition at /sdcard instead of a microSD card, so apps and data
++            work without a card. No card is probed and the SD CS pin is left
++            alone. Needs a partition table with "appfs" (partitions-diy.csv).
++
++    config BSP_TOUCH_XPT2046
++        bool "XPT2046 resistive touch panel on the display"
++        depends on BSP_BOARD_DIY && BSP_SD_INTERNAL_FLASH
++        select OS_TOUCH
++        default n
++        help
++            The touch controller on the display module, on the shared SPI bus:
++            T_CLK, T_DIN and T_DO on SCK, MOSI and MISO, T_CS and T_IRQ below.
++            Taps, drags and swipes become keys. Without a chip on T_CS the
++            badge boots as before. Needs BSP_SD_INTERNAL_FLASH because the pen
++            interrupt pin is the microSD's CS otherwise.
++
++    config BSP_TOUCH_CS
++        int "Touch CS GPIO"
++        depends on BSP_TOUCH_XPT2046
++        default 6
++
++    config BSP_TOUCH_IRQ
++        int "Touch pen interrupt GPIO (-1: poll)"
++        depends on BSP_TOUCH_XPT2046
++        range -1 28
++        default 4
++
++    config BSP_TOUCH_SPI_HZ
++        int "Touch SPI clock (Hz)"
++        depends on BSP_TOUCH_XPT2046
++        range 100000 2000000
++        default 1000000
++
++endmenu
+diff --git a/components/bsp/bsp_sd_flash.c b/components/bsp/bsp_sd_flash.c
+new file mode 100644
+index 0000000..06992d7
+--- /dev/null
++++ b/components/bsp/bsp_sd_flash.c
+@@ -0,0 +1,185 @@
++// /sdcard without a card (CONFIG_BSP_SD_INTERNAL_FLASH, breadboard build):
++// a wear-levelled FAT volume in the internal flash's "appfs" partition
++// (partitions-diy.csv), behind the same bsp_sd_* calls as the microSD in
++// bsp_sd.c, so the rest of the firmware sees a mounted card.
++//
++// The volume is formatted on first boot, or whenever it can't be mounted.
++// No card is probed and the SD CS pin is left alone.
++
++#include <stdio.h>
++#include <string.h>
++#include "freertos/FreeRTOS.h"
++#include "freertos/semphr.h"
++#include "esp_check.h"
++#include "esp_log.h"
++#include "esp_partition.h"
++#include "esp_vfs_fat.h"
++#include "wear_levelling.h"
++#include "bsp.h"
++
++static const char *TAG = "bsp_sd";
++
++#define PART_LABEL  "appfs"
++
++static SemaphoreHandle_t s_lock;
++static wl_handle_t s_wl = WL_INVALID_HANDLE;
++static bsp_sd_state_t s_state = BSP_SD_NOT_MOUNTED;
++static esp_err_t s_last_err;
++static uint64_t s_total_bytes, s_free_bytes;
++
++#define LOCK()   xSemaphoreTake(s_lock, portMAX_DELAY)
++#define UNLOCK() xSemaphoreGive(s_lock)
++
++static const esp_vfs_fat_mount_config_t s_cfg = {
++    .format_if_mount_failed = true,
++    .max_files = 5,
++    .allocation_unit_size = 4096,
++};
++
++static const esp_partition_t *part(void)
++{
++    return esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, PART_LABEL);
++}
++
++static bool ensure_lock(void)
++{
++    if (!s_lock) {
++        s_lock = xSemaphoreCreateMutex();
++    }
++    return s_lock != NULL;
++}
++
++static void update_usage_locked(void)
++{
++    s_total_bytes = s_free_bytes = 0;
++    if (s_state == BSP_SD_MOUNTED) {
++        esp_vfs_fat_info(BSP_SD_MOUNT, &s_total_bytes, &s_free_bytes);
++    }
++}
++
++static esp_err_t mount_locked(void)
++{
++    if (s_state == BSP_SD_MOUNTED) {
++        return ESP_OK;
++    }
++    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(BSP_SD_MOUNT, PART_LABEL, &s_cfg, &s_wl);
++    s_last_err = err;
++    if (err != ESP_OK) {
++        s_wl = WL_INVALID_HANDLE;
++        s_state = BSP_SD_ERROR;
++        ESP_LOGE(TAG, "internal flash FS (partition \"%s\"): %s", PART_LABEL, esp_err_to_name(err));
++        return err;
++    }
++    s_state = BSP_SD_MOUNTED;
++    update_usage_locked();
++    ESP_LOGI(TAG, "internal flash FS mounted at %s: %llu KB, %llu KB free", BSP_SD_MOUNT,
++             s_total_bytes >> 10, s_free_bytes >> 10);
++    return ESP_OK;
++}
++
++static esp_err_t unmount_locked(void)
++{
++    esp_err_t err = ESP_OK;
++    if (s_state == BSP_SD_MOUNTED) {
++        err = esp_vfs_fat_spiflash_unmount_rw_wl(BSP_SD_MOUNT, s_wl);
++    }
++    s_wl = WL_INVALID_HANDLE;
++    s_state = BSP_SD_NOT_MOUNTED;
++    s_total_bytes = s_free_bytes = 0;
++    return err;
++}
++
++esp_err_t bsp_sd_mount(void)
++{
++    ESP_RETURN_ON_ERROR(bsp_spi_bus_init(), TAG, "bus");    // the display's bus, as with a card
++    ESP_RETURN_ON_FALSE(ensure_lock(), ESP_ERR_NO_MEM, TAG, "lock");
++    LOCK();
++    esp_err_t err = mount_locked();
++    UNLOCK();
++    return err;
++}
++
++esp_err_t bsp_sd_unmount(void)
++{
++    if (!ensure_lock()) {
++        return ESP_ERR_NO_MEM;
++    }
++    LOCK();
++    esp_err_t err = unmount_locked();
++    UNLOCK();
++    return err;
++}
++
++// Unmounted around the format, so a failure leaves a clean state to retry.
++esp_err_t bsp_sd_format(void)
++{
++    if (!ensure_lock()) {
++        return ESP_ERR_NO_MEM;
++    }
++    LOCK();
++    ESP_LOGW(TAG, "formatting internal flash FS");
++    unmount_locked();
++    esp_vfs_fat_mount_config_t cfg = s_cfg;
++    esp_err_t err = esp_vfs_fat_spiflash_format_cfg_rw_wl(BSP_SD_MOUNT, PART_LABEL, &cfg);
++    esp_err_t merr = mount_locked();
++    if (err == ESP_OK) {
++        err = merr;
++    } else {
++        s_last_err = err;
++    }
++    UNLOCK();
++    return err;
++}
++
++void bsp_sd_refresh_usage(void)
++{
++    if (!s_lock) {
++        return;
++    }
++    LOCK();
++    update_usage_locked();
++    UNLOCK();
++}
++
++void bsp_sd_get_info(bsp_sd_info_t *out)
++{
++    memset(out, 0, sizeof(*out));
++    if (!s_lock) {
++        out->state = BSP_SD_NOT_MOUNTED;
++        return;
++    }
++    LOCK();
++    out->state = s_state;
++    out->last_err = s_last_err;
++    if (s_state == BSP_SD_MOUNTED) {
++        const esp_partition_t *p = part();
++        strlcpy(out->name, "flash", sizeof(out->name));
++        out->type = "internal";
++        out->card_mb = p ? p->size >> 20 : 0;
++        out->total_bytes = s_total_bytes;
++        out->free_bytes = s_free_bytes;
++    }
++    UNLOCK();
++}
++
++void bsp_sd_print_card(void)
++{
++    const esp_partition_t *p = part();
++    if (!p) {
++        printf("Storage: internal flash, no \"%s\" partition (flash partitions-diy.csv)\n", PART_LABEL);
++        return;
++    }
++    if (!ensure_lock()) {
++        return;
++    }
++    LOCK();
++    update_usage_locked();
++    printf("Storage: internal flash (no microSD), partition \"%s\" at 0x%lx, %lu KB, at %s\n", PART_LABEL,
++           (unsigned long)p->address, (unsigned long)(p->size >> 10), BSP_SD_MOUNT);
++    if (s_state == BSP_SD_MOUNTED) {
++        printf("FAT: %llu KB total, %llu KB free\n", s_total_bytes >> 10, s_free_bytes >> 10);
++    } else {
++        printf("FAT: %s (last error %s)\n", bsp_sd_state_str(s_state), esp_err_to_name(s_last_err));
++    }
++    UNLOCK();
++}
+diff --git a/components/bsp/bsp_touch.c b/components/bsp/bsp_touch.c
+new file mode 100644
+index 0000000..fd699a0
+--- /dev/null
++++ b/components/bsp/bsp_touch.c
+@@ -0,0 +1,235 @@
++// XPT2046 resistive touch controller on the shared SPI bus (breadboard build,
++// CONFIG_BSP_TOUCH_XPT2046).
++//
++// Each reading is one transaction of 6 X, 6 Y, Z1 and Z2 conversions, taken
++// while the LCD is held (bsp_bus.h). The first X and Y settle the plate and
++// are dropped; the middle 3 of the other 5 are averaged, and a frame whose 3
++// are more than SPREAD_MAX apart is noise. A press needs PRESS_FRAMES good
++// frames in a row and a release RELEASE_FRAMES without pressure; a noisy
++// frame in between is skipped, as a sliding finger gives some. The release
++// reports where the finger was LIFT_BACK frames before it lifted, since the
++// plate reads wild while the pressure fades. The backlight's PWM edges spoil
++// conversions, so its timer is frozen for the ~0.3 ms of a reading.
++//
++// The pen interrupt wakes the task while nothing touches the panel; while it
++// does, the task samples every SAMPLE_MS with the interrupt off. Without an
++// interrupt pin it polls.
++
++#include <stdlib.h>
++#include <string.h>
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "freertos/semphr.h"
++#include "driver/gpio.h"
++#include "driver/spi_master.h"
++#include "esp_check.h"
++#include "esp_log.h"
++#include "bsp.h"
++#include "bsp_bus.h"
++
++static const char *TAG = "bsp_touch";
++
++#define SAMPLES         6
++#define SPREAD_MAX      30
++#define PRESS_FRAMES    2
++#define RELEASE_FRAMES  2
++#define SAMPLE_MS       10
++#define POLL_MS         33          // no interrupt pin: ~30 Hz
++#define MOVE_MIN        24          // raw units (~2 px) before a move is reported
++#define LIFT_BACK       2           // the release is where the finger was this many good frames earlier
++
++// Commands: start bit, channel, 12-bit, differential. PD = 01 keeps the ADC on
++// and the pen interrupt off between conversions; the last one (PD = 00)
++// powers down and turns the pen interrupt back on.
++#define CMD_X           0xD1
++#define CMD_Y           0x91
++#define CMD_Z1          0xB1
++#define CMD_Z2_LAST     0xC0
++#define CONVERSIONS     (2 * SAMPLES + 2)
++#define XFER_LEN        32          // 2 bytes per conversion + 1, rounded up to whole words
++
++static spi_device_handle_t s_dev;
++static SemaphoreHandle_t s_mx;
++static bsp_touch_cb_t s_cb;
++static volatile uint16_t s_z_min = 400;
++static uint8_t s_tx[XFER_LEN] __attribute__((aligned(4)));
++static uint8_t s_rx[XFER_LEN] __attribute__((aligned(4)));
++
++#if BOARD_TOUCH_IRQ >= 0
++static SemaphoreHandle_t s_irq;
++
++static void IRAM_ATTR pen_isr(void *arg)
++{
++    BaseType_t woken = pdFALSE;
++    xSemaphoreGiveFromISR(s_irq, &woken);
++    portYIELD_FROM_ISR(woken);
++}
++#endif
++
++static void sort(uint16_t *v, int n)
++{
++    for (int i = 1; i < n; i++) {
++        for (int j = i; j > 0 && v[j - 1] > v[j]; j--) {
++            uint16_t t = v[j];
++            v[j] = v[j - 1];
++            v[j - 1] = t;
++        }
++    }
++}
++
++// Middle 3 of samples 1..SAMPLES-1; false when they spread too far.
++static bool filter(uint16_t *v, uint16_t *out)
++{
++    sort(v + 1, SAMPLES - 1);
++    uint16_t *m = v + 1 + (SAMPLES - 1 - 3) / 2;
++    *out = (m[0] + m[1] + m[2] + 1) / 3;
++    return m[2] - m[0] <= SPREAD_MAX;
++}
++
++static void read_frame(bsp_touch_raw_t *f)
++{
++    uint16_t v[CONVERSIONS];
++    xSemaphoreTake(s_mx, portMAX_DELAY);
++    memset(s_tx, 0, sizeof(s_tx));
++    for (int i = 0; i < CONVERSIONS; i++) {
++        s_tx[2 * i] = i < SAMPLES ? CMD_X : i < 2 * SAMPLES ? CMD_Y : i == 2 * SAMPLES ? CMD_Z1 : CMD_Z2_LAST;
++    }
++    spi_transaction_t t = { .length = XFER_LEN * 8, .tx_buffer = s_tx, .rx_buffer = s_rx };
++    bsp_lcd_hold();
++    bsp_backlight_freeze(true);
++    spi_device_polling_transmit(s_dev, &t);
++    bsp_backlight_freeze(false);
++    bsp_lcd_release();
++    // Each result is clocked out over the 16 bits after its command, overlapping the next command.
++    for (int i = 0; i < CONVERSIONS; i++) {
++        v[i] = (((s_rx[2 * i + 1] << 8) | s_rx[2 * i + 2]) >> 3) & 0xFFF;
++    }
++    xSemaphoreGive(s_mx);
++    f->z1 = v[2 * SAMPLES];
++    f->z2 = v[2 * SAMPLES + 1];
++    f->z = f->z1 + 4095 - f->z2;
++    bool x_ok = filter(v, &f->x), y_ok = filter(v + SAMPLES, &f->y);
++    f->down = f->z1 > 0 && f->z >= s_z_min;
++    f->ok = f->down && x_ok && y_ok;
++}
++
++// No chip: MISO's pull-up reads every bit as 1.
++static bool chip_absent(void)
++{
++    bsp_touch_raw_t f;
++    for (int i = 0; i < 3; i++) {
++        read_frame(&f);
++        if (f.z1 < 4095 || f.z2 < 4095 || f.x < 4095 || f.y < 4095) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Until the pen interrupt fires, or one poll period.
++static void wait_idle(void)
++{
++#if BOARD_TOUCH_IRQ >= 0
++    xSemaphoreTake(s_irq, 0);               // a stale edge from the last conversions
++    gpio_intr_enable(BOARD_TOUCH_IRQ);
++    if (gpio_get_level(BOARD_TOUCH_IRQ)) {
++        xSemaphoreTake(s_irq, portMAX_DELAY);
++    }
++    gpio_intr_disable(BOARD_TOUCH_IRQ);
++#else
++    vTaskDelay(pdMS_TO_TICKS(POLL_MS));
++#endif
++}
++
++static void touch_task(void *arg)
++{
++    bsp_touch_raw_t hist[LIFT_BACK + 1];    // recent good frames, newest first
++    int nhist = 0, good = 0, bad = 0;
++    bool down = false;
++    uint16_t lx = 0, ly = 0;                // last position reported
++    for (;;) {
++        if (!down && !good) {
++            wait_idle();
++        }
++        bsp_touch_raw_t f;
++        read_frame(&f);
++        if (f.ok) {
++            memmove(hist + 1, hist, sizeof(hist) - sizeof(hist[0]));
++            hist[0] = f;
++            nhist += nhist <= LIFT_BACK;
++            bad = 0;
++            if (!down && ++good >= PRESS_FRAMES) {
++                down = true;
++                lx = f.x;
++                ly = f.y;
++                s_cb(BSP_TOUCH_PRESS, f.x, f.y);
++            } else if (down && abs(f.x - lx) + abs(f.y - ly) >= MOVE_MIN) {
++                lx = f.x;
++                ly = f.y;
++                s_cb(BSP_TOUCH_MOVE, f.x, f.y);
++            }
++        } else if (!down) {
++            good = nhist = 0;
++        } else if (!f.down && ++bad >= RELEASE_FRAMES) {
++            const bsp_touch_raw_t *at = &hist[nhist - 1 < LIFT_BACK ? nhist - 1 : LIFT_BACK];
++            down = false;
++            good = bad = nhist = 0;
++            s_cb(BSP_TOUCH_RELEASE, at->x, at->y);
++            continue;
++        }
++        vTaskDelay(pdMS_TO_TICKS(SAMPLE_MS));
++    }
++}
++
++esp_err_t bsp_touch_start(bsp_touch_cb_t cb, uint16_t z_min)
++{
++    ESP_RETURN_ON_FALSE(cb && !s_dev, ESP_ERR_INVALID_STATE, TAG, "started");
++    ESP_RETURN_ON_ERROR(bsp_spi_bus_init(), TAG, "bus");
++    s_z_min = z_min;
++    spi_device_interface_config_t cfg = {
++        .clock_speed_hz = CONFIG_BSP_TOUCH_SPI_HZ,
++        .mode = 0,
++        .spics_io_num = BOARD_TOUCH_CS,
++        .queue_size = 1,
++    };
++    ESP_RETURN_ON_ERROR(spi_bus_add_device(BOARD_SPI_HOST, &cfg, &s_dev), TAG, "touch device");
++    s_mx = xSemaphoreCreateMutex();
++    if (chip_absent()) {
++        spi_bus_remove_device(s_dev);
++        s_dev = NULL;
++        ESP_LOGI(TAG, "no XPT2046 on CS %d", BOARD_TOUCH_CS);
++        return ESP_ERR_NOT_FOUND;
++    }
++    s_cb = cb;
++#if BOARD_TOUCH_IRQ >= 0
++    gpio_config_t io = {
++        .pin_bit_mask = BIT64(BOARD_TOUCH_IRQ),
++        .mode = GPIO_MODE_INPUT,
++        .pull_up_en = GPIO_PULLUP_ENABLE,
++        .intr_type = GPIO_INTR_NEGEDGE,
++    };
++    ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "irq gpio");
++    gpio_intr_disable(BOARD_TOUCH_IRQ);
++    s_irq = xSemaphoreCreateBinary();
++    esp_err_t err = gpio_install_isr_service(0);
++    ESP_RETURN_ON_FALSE(err == ESP_OK || err == ESP_ERR_INVALID_STATE, err, TAG, "isr service");
++    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(BOARD_TOUCH_IRQ, pen_isr, NULL), TAG, "isr");
++#endif
++    xTaskCreate(touch_task, "touch", 3072, NULL, 5, NULL);
++    ESP_LOGI(TAG, "XPT2046 on CS %d, %s", BOARD_TOUCH_CS, BOARD_TOUCH_IRQ >= 0 ? "pen interrupt" : "polled");
++    return ESP_OK;
++}
++
++bool bsp_touch_raw(bsp_touch_raw_t *out)
++{
++    if (!s_dev) {
++        return false;
++    }
++    read_frame(out);
++    return true;
++}
++
++void bsp_touch_set_threshold(uint16_t z_min)
++{
++    s_z_min = z_min;
++}
+diff --git a/main/core/os_touch.c b/main/core/os_touch.c
+new file mode 100644
+index 0000000..84b2ad2
+--- /dev/null
++++ b/main/core/os_touch.c
+@@ -0,0 +1,347 @@
++// Touch input: the panel's points (bsp_touch.c) become taps, drags and
++// swipes on the OS task, and those become keys, so apps need nothing new.
++//   tap                 the object under the finger answers (ui.h tap
++//                       targets), else SELECT
++//   vertical drag       a key every DRAG_STEP px, finger up = DOWN
++//   swipe right from    BACK
++//   the left edge
++//   other swipes        offered to the object under the start, else
++//                       LEFT / RIGHT (finger left = RIGHT)
++// The confirm dialog takes every touch while it is open (os.c). The
++// calibration screen (touchcal.c) gets the raw points instead.
++//
++// Console: "touch" (see cmd_touch). Its taps and swipes are synthetic: they
++// work without a panel, and never approve a confirm dialog.
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "nvs.h"
++#include "bsp.h"
++#include "os.h"
++#include "os_cmd.h"
++#include "os_touch.h"
++#include "ui.h"
++
++static const char *TAG = "touch";
++
++#define TAP_SLOP        10      // px a tap may wander
++#define DRAG_STEP       24
++#define EDGE_W          30      // a back swipe starts this close to the left edge
++#define SWIPE_MIN       50
++#define Z_DEFAULT       150     // idle reads z1 = 0; a hard press reads ~800 on a panel's weak side
++#define POST_TRIES      20
++
++static bool s_present, s_on = true, s_have_cal;
++static int32_t s_cal[6];
++static uint16_t s_z_min = Z_DEFAULT;
++
++// Written by the touch task, read anywhere.
++static volatile bool s_live_down, s_move_pending;
++static volatile uint16_t s_live_rx, s_live_ry;
++
++// The gesture in progress (OS task).
++static struct {
++    bool down, synthetic, dialog;
++    enum { G_NONE, G_VERT, G_HORIZ } mode;
++    int x0, y0, sent;
++} g;
++
++static bool map(int rx, int ry, int *x, int *y)
++{
++    if (!s_have_cal) {
++        return false;
++    }
++    int64_t sx = ((int64_t)s_cal[0] * rx + (int64_t)s_cal[1] * ry + s_cal[2] + 32768) >> 16;
++    int64_t sy = ((int64_t)s_cal[3] * rx + (int64_t)s_cal[4] * ry + s_cal[5] + 32768) >> 16;
++    *x = sx < 0 ? 0 : sx >= BOARD_LCD_H_RES ? BOARD_LCD_H_RES - 1 : (int)sx;
++    *y = sy < 0 ? 0 : sy >= BOARD_LCD_V_RES ? BOARD_LCD_V_RES - 1 : (int)sy;
++    return true;
++}
++
++bool os_touch_live(int *x, int *y)
++{
++    return s_on && s_live_down && map(s_live_rx, s_live_ry, x, y);
++}
++
++// ---------------------------------------------------------------------------
++// Gestures (OS task, LVGL locked)
++
++// Offer a tap (swipe 0) or a swipe to the object under (x, y) and its
++// parents; then press the keys it answered with, or the default.
++static void tap(int x, int y, int swipe)
++{
++    ui_tap_t t = { .p = { x, y }, .swipe = swipe };
++    lv_obj_t *o = lv_indev_search_obj(lv_layer_top(), &t.p);
++    if (!o) {
++        o = lv_indev_search_obj(lv_screen_active(), &t.p);
++    }
++    for (; o && !t.handled; o = lv_obj_get_parent(o)) {
++        lv_obj_send_event(o, ui_tap_event(), &t);
++    }
++    if (!t.handled) {
++        ui_tap_add(&t, swipe > 0 ? OS_KEY_RIGHT : swipe < 0 ? OS_KEY_LEFT : OS_KEY_SELECT);
++    }
++    for (int i = 0; i < t.n; i++) {
++        os_touch_key(t.keys[i], false);
++    }
++}
++
++static void gesture(os_touch_phase_t ph, int x, int y, bool synthetic)
++{
++    if (ph == OS_TOUCH_PRESS) {
++        g.down = true;
++        g.synthetic = synthetic;
++        g.dialog = false;
++        g.mode = G_NONE;
++        g.x0 = x;
++        g.y0 = y;
++        g.sent = 0;
++    } else if (!g.down || g.synthetic != synthetic) {
++        return;                                 // the other source's gesture
++    }
++    // Once the dialog has seen part of a gesture, the rest is the dialog's:
++    // lifting the finger after approving must not tap the app.
++    if (os_confirm_touch(ph, x, y, synthetic) || g.dialog) {
++        g.dialog = true;
++        g.down = ph != OS_TOUCH_RELEASE;
++        return;
++    }
++    int dx = x - g.x0, dy = y - g.y0;
++    if (g.mode == G_NONE && (abs(dx) > TAP_SLOP || abs(dy) > TAP_SLOP)) {
++        g.mode = abs(dy) > abs(dx) ? G_VERT : G_HORIZ;
++    }
++    if (g.mode == G_VERT) {
++        int steps = -dy / DRAG_STEP;
++        for (; g.sent < steps; g.sent++) {
++            os_touch_key(OS_KEY_DOWN, true);    // repeat: lists stop at the ends instead of wrapping
++        }
++        for (; g.sent > steps; g.sent--) {
++            os_touch_key(OS_KEY_UP, true);
++        }
++    }
++    if (ph != OS_TOUCH_RELEASE) {
++        return;
++    }
++    g.down = false;
++    if (g.mode == G_NONE) {
++        tap(g.x0, g.y0, 0);
++    } else if (g.mode == G_HORIZ && abs(dx) >= SWIPE_MIN) {
++        if (g.x0 < EDGE_W && dx > 0) {
++            os_touch_key(OS_KEY_BACK, false);
++        } else {
++            tap(g.x0, g.y0, dx < 0 ? 1 : -1);
++        }
++    }
++}
++
++// A point, packed into os_post's argument: phase, synthetic flag, x and y
++// (raw for the panel, screen coordinates for the console).
++#define PACK(ph, syn, x, y) ((void *)(uintptr_t)((ph) | (syn) << 2 | (uint32_t)(x) << 3 | (uint32_t)(y) << 16))
++
++static void posted(void *arg)
++{
++    uint32_t v = (uintptr_t)arg;
++    os_touch_phase_t ph = v & 3;
++    bool synthetic = v >> 2 & 1;
++    int x = v >> 3 & 0x1FFF, y = v >> 16 & 0x1FFF;
++    if (ph == OS_TOUCH_MOVE && !synthetic) {
++        s_move_pending = false;
++        x = s_live_rx;                          // the latest point, not the one posted
++        y = s_live_ry;
++    }
++    if (os_current() == &os_touchcal) {
++        if (!synthetic) {
++            touchcal_point(ph, x, y);
++        }
++        return;
++    }
++    if (!synthetic && (!s_on || !map(x, y, &x, &y))) {
++        return;                                 // off, or not calibrated yet
++    }
++    gesture(ph, x, y, synthetic);
++}
++
++// Press and release must arrive: wait for room in the OS queue.
++static void post(os_touch_phase_t ph, bool synthetic, int x, int y)
++{
++    for (int i = 0; i < POST_TRIES; i++) {
++        if (os_post(posted, PACK(ph, synthetic, x, y))) {
++            return;
++        }
++        vTaskDelay(pdMS_TO_TICKS(5));
++    }
++    ESP_LOGW(TAG, "dropped a touch event: OS queue full");
++}
++
++// Touch task. Moves are coalesced: at most one waits in the OS queue.
++static void on_touch(bsp_touch_ev_t ev, uint16_t rx, uint16_t ry)
++{
++    s_live_rx = rx;
++    s_live_ry = ry;
++    switch (ev) {
++    case BSP_TOUCH_PRESS:
++        s_live_down = true;
++        post(OS_TOUCH_PRESS, false, rx, ry);
++        break;
++    case BSP_TOUCH_MOVE:
++        if (!s_move_pending) {
++            s_move_pending = true;
++            if (!os_post(posted, PACK(OS_TOUCH_MOVE, 0, rx, ry))) {
++                s_move_pending = false;
++            }
++        }
++        break;
++    case BSP_TOUCH_RELEASE:
++        s_live_down = false;
++        post(OS_TOUCH_RELEASE, false, rx, ry);
++        break;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Settings in NVS "input": touchcal (6 x int32), touchz (u16), touchoff (u8)
++
++static void load(void)
++{
++    nvs_handle_t h;
++    if (nvs_open("input", NVS_READONLY, &h) != ESP_OK) {
++        return;
++    }
++    size_t len = sizeof(s_cal);
++    s_have_cal = nvs_get_blob(h, "touchcal", s_cal, &len) == ESP_OK && len == sizeof(s_cal);
++    uint16_t z;
++    if (nvs_get_u16(h, "touchz", &z) == ESP_OK) {
++        s_z_min = z;
++    }
++    uint8_t off;
++    if (nvs_get_u8(h, "touchoff", &off) == ESP_OK) {
++        s_on = !off;
++    }
++    nvs_close(h);
++}
++
++static void save(void)
++{
++    nvs_handle_t h;
++    if (nvs_open("input", NVS_READWRITE, &h) != ESP_OK) {
++        return;
++    }
++    if (s_have_cal) {
++        nvs_set_blob(h, "touchcal", s_cal, sizeof(s_cal));
++    } else {
++        nvs_erase_key(h, "touchcal");
++    }
++    nvs_set_u16(h, "touchz", s_z_min);
++    nvs_set_u8(h, "touchoff", !s_on);
++    nvs_commit(h);
++    nvs_close(h);
++}
++
++void os_touch_cal_save(const int32_t cal[6])
++{
++    memcpy(s_cal, cal, sizeof(s_cal));
++    s_have_cal = true;
++    save();
++    ESP_LOGI(TAG, "calibrated: x = %ld %ld %ld, y = %ld %ld %ld (/65536)", (long)cal[0], (long)cal[1],
++             (long)cal[2], (long)cal[3], (long)cal[4], (long)cal[5]);
++}
++
++// ---------------------------------------------------------------------------
++// Console
++
++static void print_status(void)
++{
++    printf("touch: %s, %s, threshold %u, %s\n", s_present ? "XPT2046 found" : "no panel", s_on ? "on" : "off",
++           s_z_min, s_have_cal ? "calibrated" : "not calibrated");
++    if (s_have_cal) {
++        printf("  x = (%ld*rx + %ld*ry + %ld) / 65536\n  y = (%ld*rx + %ld*ry + %ld) / 65536\n", (long)s_cal[0],
++               (long)s_cal[1], (long)s_cal[2], (long)s_cal[3], (long)s_cal[4], (long)s_cal[5]);
++    }
++}
++
++static void watch(int seconds)
++{
++    if (!s_present) {
++        printf("touch: no panel\n");
++        return;
++    }
++    printf("frames touched (z1 > 0), every 10 ms for %d s: ms, raw x, y, z1, z2, pressure (threshold %u) -> "
++           "screen x, y\n", seconds, s_z_min);
++    int64_t t0 = esp_timer_get_time();
++    for (int64_t t = 0; t < seconds * 1000000LL; t = esp_timer_get_time() - t0) {
++        bsp_touch_raw_t r;
++        bsp_touch_raw(&r);
++        if (r.z1) {
++            int x = -1, y = -1;
++            map(r.x, r.y, &x, &y);
++            printf("%5lld %4u %4u  z1 %4u z2 %4u  z %4u %-5s -> %d, %d\n", t / 1000, r.x, r.y, r.z1, r.z2, r.z,
++                   r.ok ? "DOWN" : r.down ? "noisy" : "", x, y);
++        }
++        vTaskDelay(pdMS_TO_TICKS(10));
++    }
++}
++
++static bool screen_point(char **argv, int *x, int *y)
++{
++    *x = atoi(argv[0]);
++    *y = atoi(argv[1]);
++    return *x >= 0 && *x < BOARD_LCD_H_RES && *y >= 0 && *y < BOARD_LCD_V_RES;
++}
++
++static int cmd_touch(int argc, char **argv)
++{
++    const char *sub = argc > 1 ? argv[1] : "";
++    int x1, y1, x2, y2;
++    if (!sub[0]) {
++        print_status();
++    } else if (!strcmp(sub, "watch")) {
++        watch(argc > 2 ? atoi(argv[2]) : 10);
++    } else if (!strcmp(sub, "cal") && argc == 2) {
++        os_launch(&os_touchcal);
++    } else if (!strcmp(sub, "cal") && argc == 3 && !strcmp(argv[2], "clear")) {
++        s_have_cal = false;
++        save();
++        printf("touch: calibration cleared; touches are ignored until 'touch cal'\n");
++    } else if (!strcmp(sub, "thresh") && argc == 3 && atoi(argv[2]) > 0 && atoi(argv[2]) < 8190) {
++        s_z_min = atoi(argv[2]);
++        bsp_touch_set_threshold(s_z_min);
++        save();
++        print_status();
++    } else if ((!strcmp(sub, "on") || !strcmp(sub, "off")) && argc == 2) {
++        s_on = !strcmp(sub, "on");
++        save();
++        print_status();
++    } else if (!strcmp(sub, "tap") && argc == 4 && screen_point(argv + 2, &x1, &y1)) {
++        post(OS_TOUCH_PRESS, true, x1, y1);
++        vTaskDelay(pdMS_TO_TICKS(60));
++        post(OS_TOUCH_RELEASE, true, x1, y1);
++    } else if (!strcmp(sub, "swipe") && argc == 6 && screen_point(argv + 2, &x1, &y1)
++               && screen_point(argv + 4, &x2, &y2)) {
++        post(OS_TOUCH_PRESS, true, x1, y1);
++        for (int i = 1; i <= 8; i++) {
++            vTaskDelay(pdMS_TO_TICKS(20));
++            post(i < 8 ? OS_TOUCH_MOVE : OS_TOUCH_RELEASE, true, x1 + (x2 - x1) * i / 8, y1 + (y2 - y1) * i / 8);
++        }
++    } else {
++        printf("usage: touch [watch [s] | cal [clear] | thresh <n> | on | off | tap <x> <y> | "
++               "swipe <x1> <y1> <x2> <y2>]\n");
++        return 1;
++    }
++    return 0;
++}
++
++void os_touch_start(void)
++{
++    load();
++    os_cmd_register("touch", "touch [watch [s]|cal [clear]|thresh <n>|on|off|tap <x> <y>|swipe <x1> <y1> <x2> <y2>]",
++                    cmd_touch);
++    s_present = bsp_touch_start(on_touch, s_z_min) == ESP_OK;
++    if (s_present && !s_have_cal) {
++        os_launch(&os_touchcal);                // first boot with a panel
++    }
++}
+diff --git a/main/core/os_touch.h b/main/core/os_touch.h
+new file mode 100644
+index 0000000..1124565
+--- /dev/null
++++ b/main/core/os_touch.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++// Touch input (CONFIG_OS_TOUCH): os_touch.c turns the panel's points into
++// keys and taps on the OS task; touchcal.c is the calibration screen. Apps
++// don't use this: they get keys, and ui.h's tap targets.
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "os.h"
++
++typedef enum { OS_TOUCH_PRESS, OS_TOUCH_MOVE, OS_TOUCH_RELEASE } os_touch_phase_t;
++
++extern const os_app_t os_touchcal;      // hidden system app, "open touchcal"
++
++void os_touch_start(void);              // os_start(): probe the panel, register "touch"
++
++// Finger on the panel now (not console-injected), in screen coordinates. Any task.
++bool os_touch_live(int *x, int *y);
++
++// Calibration: screen = (a*rx + b*ry + c) / 65536 for x, (d*rx + e*ry + f) / 65536 for y.
++void os_touch_cal_save(const int32_t cal[6]);
++
++// os.c, OS task: a key from a gesture (never answers the confirm dialog),
++// and the dialog's own touch targets (true: the dialog is open and took it).
++void os_touch_key(os_key_t key, bool repeat);
++bool os_confirm_touch(os_touch_phase_t ph, int x, int y, bool synthetic);
++
++// touchcal.c, OS task: raw points while the calibration screen is open.
++void touchcal_point(os_touch_phase_t ph, int rx, int ry);
+diff --git a/main/core/touchcal.c b/main/core/touchcal.c
+new file mode 100644
+index 0000000..a171b8e
+--- /dev/null
++++ b/main/core/touchcal.c
+@@ -0,0 +1,194 @@
++// Touch calibration: a cross at three points, then a fourth to check the
++// fit. The fit is affine (x = a*rx + b*ry + c, same for y), which covers the
++// panel being swapped, mirrored or a little skewed against the display. It
++// starts over when the check misses by more than CHECK_MAX px. BOOT or
++// CANCEL aborts. Opens by itself on the first boot with a panel.
++
++#include <stdlib.h>
++#include <string.h>
++#include "esp_timer.h"
++#include "os.h"
++#include "os_touch.h"
++#include "ui.h"
++
++#define POINTS      3
++#define CHECK_MAX   8           // px
++#define STILL_MAX   200         // raw: a press that slides further is redone
++#define CROSS       21
++
++static const int16_t s_target[POINTS + 1][2] = { {32, 32}, {288, 120}, {160, 216}, {64, 200} };
++
++static lv_obj_t *s_cross, *s_prompt, *s_step;
++static int s_cur;
++static int32_t s_raw[POINTS][2], s_cal[6];
++static int32_t s_sum[2], s_min[2], s_max[2], s_n;     // this press; s_n -1: none yet
++static int64_t s_done_at;
++
++static void render(void)
++{
++    if (s_cur > POINTS) {
++        lv_obj_set_hidden(s_cross, true);
++        lv_label_set_text(s_prompt, "Saved");
++        lv_label_set_text(s_step, "Touch calibrated");
++        return;
++    }
++    lv_obj_set_pos(s_cross, s_target[s_cur][0] - CROSS / 2, s_target[s_cur][1] - CROSS / 2);
++    lv_label_set_text(s_prompt, s_cur < POINTS ? "Tap the cross" : "Once more");
++    if (s_cur < POINTS) {
++        lv_label_set_text_fmt(s_step, "Point %d of %d: press, hold still, lift", s_cur + 1, POINTS);
++    } else {
++        lv_label_set_text(s_step, "Checking the fit");
++    }
++}
++
++static lv_obj_t *line(lv_obj_t *parent, int x, int y, int w, int h)
++{
++    lv_obj_t *l = lv_obj_create(parent);
++    lv_obj_remove_style_all(l);
++    lv_obj_set_pos(l, x, y);
++    lv_obj_set_size(l, w, h);
++    lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
++    lv_obj_set_style_bg_color(l, ui_col(COL_GREEN), 0);
++    return l;
++}
++
++static void enter(lv_obj_t *root)
++{
++    s_cur = 0;
++    s_n = -1;
++    s_done_at = 0;
++    s_prompt = ui_label(root, &sol_font_20, COL_TEXT, "");
++    lv_obj_align(s_prompt, LV_ALIGN_CENTER, 0, -14);
++    s_step = ui_label(root, &sol_mono_12, COL_DIM, "");
++    lv_obj_align(s_step, LV_ALIGN_CENTER, 0, 12);
++    ui_hint(root, "BOOT or CANCEL to skip");
++    // Over everything, in screen coordinates (the status bar too).
++    s_cross = lv_obj_create(lv_layer_top());
++    lv_obj_remove_style_all(s_cross);
++    lv_obj_set_size(s_cross, CROSS, CROSS);
++    line(s_cross, CROSS / 2, 0, 1, CROSS);
++    line(s_cross, 0, CROSS / 2, CROSS, 1);
++    render();
++}
++
++static void leave(void)
++{
++    lv_obj_delete(s_cross);
++    s_cross = NULL;
++}
++
++static int64_t det3(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f, int64_t g, int64_t h,
++                    int64_t i)
++{
++    return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
++}
++
++// Solves a*rx + b*ry + c = target at the three points, x then y, by
++// Cramer's rule, in 1/65536. false: the points are (nearly) on a line.
++static bool solve(void)
++{
++    const int32_t (*r)[2] = s_raw;
++    int64_t det = det3(r[0][0], r[0][1], 1, r[1][0], r[1][1], 1, r[2][0], r[2][1], 1);
++    if (llabs(det) < 1000) {
++        return false;
++    }
++    for (int k = 0; k < 2; k++) {
++        int64_t t0 = s_target[0][k], t1 = s_target[1][k], t2 = s_target[2][k];
++        int64_t a = det3(t0, r[0][1], 1, t1, r[1][1], 1, t2, r[2][1], 1);
++        int64_t b = det3(r[0][0], t0, 1, r[1][0], t1, 1, r[2][0], t2, 1);
++        int64_t c = det3(r[0][0], r[0][1], t0, r[1][0], r[1][1], t1, r[2][0], r[2][1], t2);
++        s_cal[3 * k] = (int32_t)(a * 65536 / det);
++        s_cal[3 * k + 1] = (int32_t)(b * 65536 / det);
++        s_cal[3 * k + 2] = (int32_t)(c * 65536 / det);
++    }
++    return true;
++}
++
++static void restart(const char *why, int px)
++{
++    os_toast(why, px);
++    s_cur = 0;
++    render();
++}
++
++// One finished press at its average raw point.
++static void point(int rx, int ry)
++{
++    if (s_cur < POINTS) {
++        s_raw[s_cur][0] = rx;
++        s_raw[s_cur][1] = ry;
++        if (++s_cur == POINTS && !solve()) {
++            restart("Those points were too close together. Again", 0);
++            return;
++        }
++        render();
++        return;
++    }
++    int x = (int)(((int64_t)s_cal[0] * rx + (int64_t)s_cal[1] * ry + s_cal[2]) >> 16);
++    int y = (int)(((int64_t)s_cal[3] * rx + (int64_t)s_cal[4] * ry + s_cal[5]) >> 16);
++    int dx = x - s_target[POINTS][0], dy = y - s_target[POINTS][1];
++    if (dx * dx + dy * dy > CHECK_MAX * CHECK_MAX) {
++        int off = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
++        restart("That was %d px off. Once more from the start", off);
++        return;
++    }
++    os_touch_cal_save(s_cal);
++    s_cur++;
++    s_done_at = esp_timer_get_time();
++    render();
++}
++
++void touchcal_point(os_touch_phase_t ph, int rx, int ry)
++{
++    if (s_cur > POINTS) {
++        return;
++    }
++    if (ph == OS_TOUCH_PRESS) {
++        s_n = 0;
++        s_sum[0] = s_sum[1] = 0;
++        s_min[0] = s_min[1] = 4095;
++        s_max[0] = s_max[1] = 0;
++    }
++    if (s_n < 0) {
++        return;                         // a touch from before this screen opened
++    }
++    int v[2] = { rx, ry };
++    for (int k = 0; k < 2; k++) {
++        s_sum[k] += v[k];
++        s_min[k] = v[k] < s_min[k] ? v[k] : s_min[k];
++        s_max[k] = v[k] > s_max[k] ? v[k] : s_max[k];
++    }
++    s_n++;
++    if (ph != OS_TOUCH_RELEASE) {
++        return;
++    }
++    int n = s_n;
++    s_n = -1;
++    if (s_max[0] - s_min[0] > STILL_MAX || s_max[1] - s_min[1] > STILL_MAX) {
++        os_toast("Hold still on the cross");
++        return;
++    }
++    point(s_sum[0] / n, s_sum[1] / n);
++}
++
++static bool on_key(os_key_t key, bool repeat)
++{
++    return key != OS_KEY_BACK;          // CANCEL leaves (to the launcher), the rest does nothing
++}
++
++static void on_tick(void)
++{
++    if (s_done_at && esp_timer_get_time() - s_done_at > 1500000) {
++        s_done_at = 0;
++        os_launch(&os_launcher);
++    }
++}
++
++const os_app_t os_touchcal = {
++    .id = "touchcal",
++    .name = "Calibrate touch",
++    .on_enter = enter,
++    .on_exit = leave,
++    .on_key = on_key,
++    .on_tick = on_tick,
++};
+diff --git a/emulator/platform/bsp_sd_flash_emu.c b/emulator/platform/bsp_sd_flash_emu.c
+new file mode 100644
+index 0000000..f8d4008
+--- /dev/null
++++ b/emulator/platform/bsp_sd_flash_emu.c
+@@ -0,0 +1,2 @@
++// bsp_sd_flash.c is the breadboard's other bsp_sd.c (CONFIG_BSP_SD_INTERNAL_FLASH):
++// bsp_sd_emu.c stands in for both.
+diff --git a/emulator/platform/bsp_touch_emu.c b/emulator/platform/bsp_touch_emu.c
+new file mode 100644
+index 0000000..427ee57
+--- /dev/null
++++ b/emulator/platform/bsp_touch_emu.c
+@@ -0,0 +1,18 @@
++// No touch panel in the emulator (the badge's bsp_touch.c is the breadboard's
++// XPT2046, built only with CONFIG_BSP_TOUCH_XPT2046; nothing here calls it).
++
++#include "bsp.h"
++
++esp_err_t bsp_touch_start(bsp_touch_cb_t cb, uint16_t z_min)
++{
++    return ESP_ERR_NOT_FOUND;
++}
++
++bool bsp_touch_raw(bsp_touch_raw_t *out)
++{
++    return false;
++}
++
++void bsp_touch_set_threshold(uint16_t z_min)
++{
++}
+diff --git a/partitions-diy.csv b/partitions-diy.csv
+new file mode 100644
+index 0000000..9c749ce
+--- /dev/null
++++ b/partitions-diy.csv
+@@ -0,0 +1,13 @@
++# Solana OS, breadboard build without a microSD card (sdkconfig.diy), 16 MB flash.
++# Name,     Type, SubType,  Offset,   Size
++nvs,        data, nvs,      0x9000,   0x6000
++otadata,    data, ota,      0xF000,   0x2000
++phy_init,   data, phy,      0x11000,  0x1000
++ota_0,      app,  ota_0,    0x20000,  0x400000
++ota_1,      app,  ota_1,    0x420000, 0x400000
++# storage: used raw for store apps' compiled code (main/lua/lua_xip.c), two
++# 1 MB slots: the app running and the one before it.
++storage,    data, fat,      0x820000, 0x200000
++# appfs: wear-levelled FAT mounted at /sdcard in place of the card
++# (components/bsp/bsp_sd_flash.c).
++appfs,      data, fat,      0xA20000, 0x5E0000
+diff --git a/sdkconfig.diy b/sdkconfig.diy
+new file mode 100644
+index 0000000..3a7e016
+--- /dev/null
++++ b/sdkconfig.diy
+@@ -0,0 +1,25 @@
++# The breadboard build (components/bsp/Kconfig, BSP_BOARD_DIY), on top of sdkconfig.defaults:
++#   idf.py -B build-diy -D SDKCONFIG=build-diy/sdkconfig \
++#          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diy" build flash monitor
++CONFIG_BSP_BOARD_DIY=y
++# No badge server until "server <url>" sets one: Solana's is for the conference badges.
++CONFIG_SOLANA_OS_SERVER_URL=""
++# No microSD: /sdcard is a FAT volume in the internal flash's appfs partition.
++CONFIG_BSP_SD_INTERNAL_FLASH=y
++CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-diy.csv"
++# XPT2046 touch on the display: T_CS on GPIO6, T_IRQ not wired (polled); see BSP_TOUCH_* in components/bsp/Kconfig.
++CONFIG_BSP_TOUCH_XPT2046=y
++CONFIG_BSP_TOUCH_IRQ=-1
++# The ESP32-C5-WROOM-1 N16R8 has 8 MB of quad PSRAM: malloc() uses it for big
++# blocks, and mbedTLS takes all its buffers from it, so a TLS handshake no
++# longer needs ~35 KB of internal RAM. A module without PSRAM still boots.
++CONFIG_SPIRAM=y
++CONFIG_SPIRAM_MODE_QUAD=y
++CONFIG_SPIRAM_SPEED_80M=y
++CONFIG_SPIRAM_USE_MALLOC=y
++CONFIG_SPIRAM_IGNORE_NOTFOUND=y
++CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
++# ESP-IDF's flash driver, not the ROM's (sdkconfig.defaults): after a write the C5 ROM
++# invalidates every cache page whose MMU entry has the same page number, PSRAM's too, so
++# an NVS write (flash pages 0-1) threw away cached PSRAM pages 0-1, the start of the heap.
++CONFIG_SPI_FLASH_ROM_IMPL=n

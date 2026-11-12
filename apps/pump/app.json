@@ -1,0 +1,17 @@
+{
+  "id": "pump",
+  "name": "pump.fun",
+  "version": "0.2.0",
+  "author": "kairayden",
+  "summary": "Launch a pump.fun coin from the badge's own wallet.",
+  "icon": "charge",
+  "icon_image": "icon.png",
+  "accent": "14F195",
+  "category": "tools",
+  "permissions": [
+    "wallet",
+    "chain",
+    "ipfs",
+    "led"
+  ]
+}

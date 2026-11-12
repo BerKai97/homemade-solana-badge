@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.part
+# made by tools/badge_put.py --out for the emulator page
+firmware/emulator/harness/apps/
