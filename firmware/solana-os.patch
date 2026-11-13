@@ -1,3 +1,16 @@
+diff --git a/README.md b/README.md
+index 0b81e14..789b959 100644
+--- a/README.md
++++ b/README.md
+@@ -46,6 +46,8 @@ idf.py -p /dev/cu.usbserial-110 -b 460800 flash
+ 
+ `tools/badge.py` drives the badge's serial console from the host and saves
+ `shot` screenshots as PNGs (`python3 tools/badge.py --reset "shot"`).
++`hold <up|down|left|right|select|back> <down|up>...` (or `hold clear`) holds keys like
++the buttons for games; they let go 1.5 s after the last `hold` line, so a host keeps them with a bare `hold`.
+ 
+ ## Layout
+ 
 diff --git a/components/bsp/CMakeLists.txt b/components/bsp/CMakeLists.txt
 index 623a790..bcb761c 100644
 --- a/components/bsp/CMakeLists.txt
@@ -70,28 +83,50 @@ index 6c1cc5d..b2fda4e 100644
 +// spoil the conversions. No-op until the display has started.
 +void bsp_backlight_freeze(bool freeze);
 diff --git a/components/bsp/bsp_buttons.c b/components/bsp/bsp_buttons.c
-index 7f92e43..6e73601 100644
+index 7f92e43..ab08413 100644
 --- a/components/bsp/bsp_buttons.c
 +++ b/components/bsp/bsp_buttons.c
-@@ -1,4 +1,5 @@
+@@ -1,8 +1,10 @@
 -// PB1..PB6 on the TCA9534 expander (INT on GPIO25) plus the BOOT button.
 +// PB1..PB6 on the TCA9534 expander (INT on GPIO25) plus the BOOT button; on a
-+// breadboard build (CONFIG_BSP_BOARD_DIY), PB1..PB6 straight on GPIOs.
++// breadboard build (CONFIG_BSP_BOARD_DIY), PB1..PB6 straight on GPIOs. Buttons
++// held from the console (bsp_buttons_hold) count as pressed too.
  
++#include <stdatomic.h>
  #include "freertos/FreeRTOS.h"
  #include "freertos/task.h"
-@@ -15,11 +16,66 @@ static const char *TAG = "bsp_buttons";
+-#include "freertos/semphr.h"
+ #include "driver/gpio.h"
+ #include "driver/i2c_master.h"
+ #include "esp_check.h"
+@@ -15,15 +17,82 @@ static const char *TAG = "bsp_buttons";
  #define TCA9534_REG_CONFIG  3
  #define POLL_MS             50
  
 -static i2c_master_dev_handle_t s_tca;
 -static SemaphoreHandle_t s_irq;
  static bsp_btn_cb_t s_cb;
- static volatile uint32_t s_pressed;
- 
+-static volatile uint32_t s_pressed;
++static TaskHandle_t s_task;
++static volatile uint32_t s_hw, s_pressed;
++static _Atomic uint32_t s_held;
++
++// Button task only: report what changed in hardware | held.
++static void publish(void)
++{
++    uint32_t now = s_hw | atomic_load(&s_held);
++    uint32_t changed = now ^ s_pressed;
++    if (changed) {
++        s_pressed = now;
++        if (s_cb) {
++            s_cb(now, changed);
++        }
++    }
++}
++
 +#if CONFIG_BSP_BOARD_DIY
 +// Each button pulls its GPIO to GND. Polled; a change counts once two reads
-+// POLL_MS apart agree (debounce).
++// DIY_POLL_MS apart agree (debounce). A hold wakes the task without a read.
 +#define DIY_POLL_MS 15
 +
 +static const int s_gpios[BOARD_BTN_COUNT] = BOARD_BTN_GPIOS;
@@ -112,18 +147,16 @@ index 7f92e43..6e73601 100644
 +
 +static void diy_task(void *arg)
 +{
-+    uint32_t last = s_pressed;
++    uint32_t last = s_hw;
 +    for (;;) {
-+        vTaskDelay(pdMS_TO_TICKS(DIY_POLL_MS));
-+        uint32_t now = read_gpios();
-+        if (now == last && now != s_pressed) {
-+            uint32_t changed = now ^ s_pressed;
-+            s_pressed = now;
-+            if (s_cb) {
-+                s_cb(now, changed);
++        if (!ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(DIY_POLL_MS))) {
++            uint32_t now = read_gpios();
++            if (now == last) {
++                s_hw = now;
 +            }
++            last = now;
 +        }
-+        last = now;
++        publish();
 +    }
 +}
 +
@@ -137,19 +170,66 @@ index 7f92e43..6e73601 100644
 +    gpio_config_t io = { .pin_bit_mask = mask, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE };
 +    ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "gpio");
 +    vTaskDelay(pdMS_TO_TICKS(2));           // let the pull-ups settle
-+    s_pressed = read_gpios();
-+    xTaskCreate(diy_task, "buttons", 2048, NULL, 5, NULL);
++    s_hw = s_pressed = read_gpios();
++    xTaskCreate(diy_task, "buttons", 2048, NULL, 5, &s_task);
 +    return ESP_OK;
 +}
 +
 +#else
 +static i2c_master_dev_handle_t s_tca;
-+static SemaphoreHandle_t s_irq;
-+
+ 
  static void IRAM_ATTR tca_isr(void *arg)
  {
      BaseType_t woken = pdFALSE;
-@@ -94,6 +150,8 @@ esp_err_t bsp_buttons_start(bsp_btn_cb_t cb)
+-    xSemaphoreGiveFromISR(s_irq, &woken);
++    vTaskNotifyGiveFromISR(s_task, &woken);
+     portYIELD_FROM_ISR(woken);
+ }
+ 
+@@ -31,7 +100,7 @@ static uint32_t read_buttons(void)
+ {
+     uint8_t reg = TCA9534_REG_INPUT, port = 0xFF;
+     if (i2c_master_transmit_receive(s_tca, &reg, 1, &port, 1, 50) != ESP_OK) {
+-        return s_pressed;   // keep last state on a bus hiccup
++        return s_hw;        // keep last state on a bus hiccup
+     }
+     uint32_t pressed = ~port & ((1u << BOARD_BTN_COUNT) - 1);
+     if (!gpio_get_level(BOARD_BOOT_BTN)) {
+@@ -43,16 +112,10 @@ static uint32_t read_buttons(void)
+ static void button_task(void *arg)
+ {
+     for (;;) {
+-        // The expander interrupt wakes us early; polling covers BOOT and any missed edge.
+-        xSemaphoreTake(s_irq, pdMS_TO_TICKS(POLL_MS));
+-        uint32_t now = read_buttons();
+-        uint32_t changed = now ^ s_pressed;
+-        if (changed) {
+-            s_pressed = now;
+-            if (s_cb) {
+-                s_cb(now, changed);
+-            }
+-        }
++        // The expander interrupt (or a hold) wakes us early; polling covers BOOT and any missed edge.
++        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POLL_MS));
++        s_hw = read_buttons();
++        publish();
+     }
+ }
+ 
+@@ -84,17 +147,27 @@ esp_err_t bsp_buttons_start(bsp_btn_cb_t cb)
+         .pull_up_en = GPIO_PULLUP_ENABLE,
+     };
+     ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "gpio");
++    s_hw = s_pressed = read_buttons();
++    xTaskCreate(button_task, "buttons", 2048, NULL, 5, &s_task);    // an I2C read and a callback: ~600 B used
++
+     gpio_set_intr_type(BOARD_TCA9534_INT, GPIO_INTR_NEGEDGE);
+-    s_irq = xSemaphoreCreateBinary();
+     gpio_install_isr_service(0);
+     ESP_RETURN_ON_ERROR(gpio_isr_handler_add(BOARD_TCA9534_INT, tca_isr, NULL), TAG, "isr");
+-
+-    s_pressed = read_buttons();
+-    xTaskCreate(button_task, "buttons", 2048, NULL, 5, NULL);    // an I2C read and a callback: ~600 B used
      return ESP_OK;
  }
  
@@ -158,6 +238,16 @@ index 7f92e43..6e73601 100644
  uint32_t bsp_buttons_get(void)
  {
      return s_pressed;
+ }
++
++void bsp_buttons_hold(uint32_t down, uint32_t up)
++{
++    atomic_fetch_and(&s_held, ~up);
++    atomic_fetch_or(&s_held, down);
++    if (s_task) {
++        xTaskNotifyGive(s_task);
++    }
++}
 diff --git a/components/bsp/bsp_display.c b/components/bsp/bsp_display.c
 index 70cc560..a196cf4 100644
 --- a/components/bsp/bsp_display.c
@@ -384,7 +474,7 @@ index 415798c..93312ad 100644
  // UART0 console via CH340C
  #define BOARD_UART_TX           11
 diff --git a/components/bsp/include/bsp.h b/components/bsp/include/bsp.h
-index 8e6c307..89a6317 100644
+index 8e6c307..87b8ff7 100644
 --- a/components/bsp/include/bsp.h
 +++ b/components/bsp/include/bsp.h
 @@ -47,7 +47,7 @@ void bsp_backlight(bool on);
@@ -396,10 +486,13 @@ index 8e6c307..89a6317 100644
  // cyan with it, and nothing on the bus tells the two apart: same ILI9341, same
  // registers. The OS applies the user's setting (Settings > Invert colours).
  // Any task but the LVGL task's flush path.
-@@ -61,6 +61,19 @@ typedef void (*bsp_btn_cb_t)(uint32_t pressed, uint32_t changed);
+@@ -60,6 +60,21 @@ bool bsp_display_inverted(void);
+ typedef void (*bsp_btn_cb_t)(uint32_t pressed, uint32_t changed);
  esp_err_t bsp_buttons_start(bsp_btn_cb_t cb);
  uint32_t bsp_buttons_get(void);
- 
++// Console-held buttons: they read as pressed, with the hardware's, until let go.
++void bsp_buttons_hold(uint32_t down, uint32_t up);
++
 +// ---- Touch panel (XPT2046, CONFIG_BSP_TOUCH_XPT2046) ----
 +// Raw readings, 0..4095 on each axis; z is the pressure (z1 + 4095 - z2).
 +typedef enum { BSP_TOUCH_PRESS, BSP_TOUCH_MOVE, BSP_TOUCH_RELEASE } bsp_touch_ev_t;
@@ -412,10 +505,9 @@ index 8e6c307..89a6317 100644
 +esp_err_t bsp_touch_start(bsp_touch_cb_t cb, uint16_t z_min);   // ESP_ERR_NOT_FOUND: no chip
 +bool bsp_touch_raw(bsp_touch_raw_t *out);                      // a fresh reading; false: not started
 +void bsp_touch_set_threshold(uint16_t z_min);
-+
+ 
  // ---- RGB LEDs ----
  esp_err_t bsp_rgb_init(void);
- void bsp_rgb_set(int index, uint8_t r, uint8_t g, uint8_t b);
 diff --git a/docs/LUA_API.md b/docs/LUA_API.md
 index 70dbb20..b1564af 100644
 --- a/docs/LUA_API.md
@@ -893,7 +985,7 @@ index ebcbd77..918cd1c 100644
      s_led_label = ui_label(p, &sol_font_14, COL_TEXT, "");
      lv_obj_set_pos(s_led_label, 8, 142);
 diff --git a/main/core/console.c b/main/core/console.c
-index 65ec2d0..13461cc 100644
+index 65ec2d0..166ec2a 100644
 --- a/main/core/console.c
 +++ b/main/core/console.c
 @@ -12,6 +12,10 @@
@@ -922,7 +1014,48 @@ index 65ec2d0..13461cc 100644
             BOARD_SD_CS, BOARD_I2C_SCL, BOARD_I2C_SDA, BOARD_TCA9534_ADDR, BOARD_TCA9534_INT, BOARD_BOOT_BTN,
             BOARD_RGB_COUNT, BOARD_RGB_GPIO, BOARD_BAT_ADC_GPIO, BOARD_BAT_DIVIDER, BOARD_UART_TX, BOARD_UART_RX);
      int mv = bsp_battery_mv();
-@@ -342,6 +347,56 @@ static int cmd_reboot(int argc, char **argv)
+@@ -226,6 +231,40 @@ static int cmd_key(int argc, char **argv)
+     return 0;
+ }
+ 
++// Keys held from the host, for games: they act as the buttons, auto-repeat and
++// sys.keys() included. All let go 1.5 s after the last hold line ("hold" alone
++// keeps them), so a closed port can't leave one stuck.
++#define HOLD_TIMEOUT_US (1500 * 1000)
++
++static esp_timer_handle_t s_hold_timer;
++
++static void hold_expired(void *arg)
++{
++    bsp_buttons_hold(0, UINT32_MAX);
++}
++
++static int cmd_hold(int argc, char **argv)
++{
++    uint32_t down = 0, up = 0;
++    if (argc == 2 && !strcmp(argv[1], "clear")) {
++        up = UINT32_MAX;
++    } else {
++        for (int i = 1; i < argc; i += 2) {
++            os_key_t k = os_key_parse(argv[i]);
++            const char *s = i + 1 < argc ? argv[i + 1] : "";
++            if (k == OS_KEY_NONE || k == OS_KEY_HOME || (strcmp(s, "down") && strcmp(s, "up"))) {
++                printf("usage: hold [<up|down|left|right|select|back> <down|up>]... | hold clear\n");
++                return 1;
++            }
++            *(strcmp(s, "down") ? &up : &down) |= os_key_button(k);
++        }
++    }
++    esp_timer_stop(s_hold_timer);
++    esp_timer_start_once(s_hold_timer, HOLD_TIMEOUT_US);
++    bsp_buttons_hold(down, up);
++    return 0;
++}
++
+ static int cmd_wifi(int argc, char **argv)
+ {
+     const char *sub = argc > 1 ? argv[1] : "status";
+@@ -342,6 +381,56 @@ static int cmd_reboot(int argc, char **argv)
      return 0;
  }
  
@@ -979,7 +1112,7 @@ index 65ec2d0..13461cc 100644
  // The REPL waits in our command meanwhile, so the UART is ours: read its
  // driver directly (the REPL installed it). stdin's VFS would add nothing, and
  // in the console's CR mode it holds no byte back.
-@@ -350,6 +405,11 @@ int console_stream_read(void *buf, size_t n, int timeout_ms)
+@@ -350,6 +439,11 @@ int console_stream_read(void *buf, size_t n, int timeout_ms)
      if (!n) {
          return 0;                           // asking whether this console streams: it does
      }
@@ -991,7 +1124,24 @@ index 65ec2d0..13461cc 100644
      int got = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buf, n, pdMS_TO_TICKS(timeout_ms));
      return got < 0 ? -1 : got;
  }
-@@ -392,6 +452,9 @@ static void start_now(void)
+@@ -364,6 +458,8 @@ static void start_now(void)
+     repl_cfg.task_stack_size = 5 * 1024;
+     esp_console_dev_uart_config_t uart_cfg = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+     ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_cfg, &repl_cfg, &repl));
++    const esp_timer_create_args_t hold = { .callback = hold_expired, .name = "hold" };
++    ESP_ERROR_CHECK(esp_timer_create(&hold, &s_hold_timer));
+ 
+     const esp_console_cmd_t cmds[] = {
+         { .command = "info", .help = "Board pinout, battery, buttons, SD card", .func = cmd_info },
+@@ -374,6 +470,7 @@ static void start_now(void)
+         { .command = "apps", .help = "List installed apps", .func = cmd_apps },
+         { .command = "open", .help = "open <app id|home> - launch an app", .func = cmd_open },
+         { .command = "key", .help = "key <up|down|left|right|select|back|home>... - press keys", .func = cmd_key },
++        { .command = "hold", .help = "hold [<key> <down|up>]... | hold clear - hold keys like the buttons; let go 1.5 s after the last hold", .func = cmd_hold },
+         { .command = "wifi", .help = "wifi [status|on|off|connect <ssid> [pass [channel]]|forget]", .func = cmd_wifi },
+         { .command = "server", .help = "server [url|clear] - show or set the badge server", .func = cmd_server },
+         { .command = "cloud", .help = "cloud [hangup] - badge server link: state, badge ID, owner, claim URL; hangup closes the connection", .func = cmd_cloud },
+@@ -392,6 +489,9 @@ static void start_now(void)
      }
      esp_console_register_help_command();
      ESP_ERROR_CHECK(esp_console_start_repl(repl));

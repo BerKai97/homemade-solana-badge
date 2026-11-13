@@ -15,10 +15,11 @@ Launch a pump.fun coin from a homemade Solana Breakpoint 2026 badge (ESP32-C5, S
     (`main/img`), and picture icons in the Apps list (`icon_image`).
   - `kb`: a console command that types into the on-screen keyboard from a PC.
   - `solana-os.patch`: the changes to Solana OS's own files: the breadboard build (touch, apps in
-    the internal flash), compiled apps sent over USB, and `docs/LUA_API.md` for all of the above.
+    the internal flash), compiled apps sent over USB, keys held from a PC (`hold`), and
+    `docs/LUA_API.md` for all of the above.
 - `tools/`: `badge_put.py` copies an app onto the badge over USB (compiled on the PC, see below),
-  `badge_remote.py` drives it from the PC's keyboard, `badge_type.py` types into a text field,
-  `badge_mint.py` gives it a mint keypair made on the PC.
+  `badge_remote.py` drives it from the PC's keyboard (`--play` holds keys down, for games),
+  `badge_type.py` types into a text field, `badge_mint.py` gives it a mint keypair made on the PC.
 
 ## Build
 

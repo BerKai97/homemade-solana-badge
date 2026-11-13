@@ -3,6 +3,7 @@
 
   tools/badge_remote.py                  # the badge found by USB ID
   tools/badge_remote.py /dev/ttyACM1     # this port
+  uv run --with pygame tools/badge_remote.py --play     # game mode
 
 Key mode (at start): the arrow keys move the badge's selection, Enter selects,
 Esc goes back, and Home, F1 (or h) go to the home screen. While a text field is
@@ -15,7 +16,14 @@ command (Backspace, Ctrl+U or Esc clear, Up/Down recall this session's commands)
 and Enter sends it; all the badge's output shows, as it arrives. A paste goes into
 the line, its newlines as spaces. Nothing typed is saved anywhere.
 Ctrl+C or Ctrl+Q quits.
-Only the standard library (badge_serial.py drives the port with termios).
+
+Game mode (--play): a terminal can't report key releases, a window can, so this opens
+one and a key stays held on the badge while you hold it. Arrows or WASD move, Space or
+Enter select, Esc or Backspace back, h or Home home. Uses the console's `hold`
+command; the badge lets go of every key 1.5 s after the last `hold` line, so a held key
+is kept with a bare `hold` every half second.
+
+Only the standard library (badge_serial.py drives the port with termios); --play needs pygame.
 """
 import argparse
 import codecs
@@ -31,6 +39,7 @@ from badge_serial import kb_lines, open_badge
 
 ESC_WAIT = 0.05     # a bare Esc: no more bytes this soon after it
 STALE = 1.0         # seconds a "kb: open|closed" reply stays good
+KEEPALIVE = 0.5     # seconds between bare `hold` lines while a key is held
 ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left"}
 ECHO = {"up": "↑", "down": "↓", "left": "←", "right": "→", "select": "⏎", "back": "⎋", "home": "⌂"}
 PROMPT = "sol> "
@@ -265,16 +274,88 @@ def say(text):
     sys.stderr.flush()
 
 
+def connect(port):
+    badge = open_badge(port)
+    badge.send("")                                  # the first line after opening often arrives garbled
+    badge.read_for(0.3)
+    return badge
+
+
+def play(port):
+    """Game mode: keys from a pygame window, held on the badge while held here."""
+    try:
+        import pygame
+    except ImportError:
+        sys.exit("needs pygame: uv run --with pygame tools/badge_remote.py --play")
+    keys = {
+        pygame.K_UP: "up", pygame.K_DOWN: "down", pygame.K_LEFT: "left", pygame.K_RIGHT: "right",
+        pygame.K_w: "up", pygame.K_s: "down", pygame.K_a: "left", pygame.K_d: "right",
+        pygame.K_SPACE: "select", pygame.K_RETURN: "select", pygame.K_KP_ENTER: "select",
+        pygame.K_ESCAPE: "back", pygame.K_BACKSPACE: "back",
+    }
+    badge = connect(port)
+    remote, down, last = Remote(badge), {}, 0.0     # down: badge key -> the PC keys holding it
+    pygame.init()
+    screen = pygame.display.set_mode((560, 100))
+    pygame.display.set_caption("Badge play")
+    font = pygame.font.Font(None, 22)
+
+    def send(line):
+        nonlocal last
+        badge.send(line)
+        last = time.time()
+
+    def draw():
+        screen.fill((20, 20, 24))
+        for i, text in enumerate(["Keys go to the badge while this window has focus.",
+                                  "Arrows/WASD move, Space/Enter select, Esc/Backspace back, h/Home home.",
+                                  "Held: " + (" ".join(sorted(down)) or "-")]):
+            screen.blit(font.render(text, True, (230, 230, 230)), (12, 16 + 26 * i))
+        pygame.display.flip()
+
+    draw()
+    try:
+        while True:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    return
+                if ev.type == pygame.WINDOWFOCUSLOST and down:
+                    down.clear()
+                    send("hold clear")
+                elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_HOME, pygame.K_h):
+                    send("key home")
+                elif ev.type in (pygame.KEYDOWN, pygame.KEYUP) and ev.key in keys:
+                    key, pressed = keys[ev.key], ev.type == pygame.KEYDOWN
+                    was = key in down
+                    holders = down.setdefault(key, set())
+                    (holders.add if pressed else holders.discard)(ev.key)
+                    if not holders:
+                        del down[key]
+                    if was != (key in down):
+                        send(f"hold {key} {'down' if pressed else 'up'}")
+                else:
+                    continue
+                draw()
+            if down and time.time() - last > KEEPALIVE:
+                send("hold")
+            remote.pump()
+    finally:
+        badge.send("hold clear")
+        badge.close()
+        pygame.quit()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port", nargs="?", help="the badge's port, e.g. /dev/ttyACM0 (default: found by its USB ID)")
+    ap.add_argument("--play", action="store_true", help="game mode: hold keys in a pygame window")
     a = ap.parse_args()
+    if a.play:
+        return play(a.port)
     if not sys.stdin.isatty():
         sys.exit("run this in a terminal: it reads the keys as you press them")
-    badge = open_badge(a.port)
+    badge = connect(a.port)
     remote = Remote(badge)
-    badge.send("")                                  # the first line after opening often arrives garbled
-    badge.read_for(0.3)
     badge.send("kb")
     remote.pump(0.5, lambda: remote.kb is not None)
     if remote.kb is None:
