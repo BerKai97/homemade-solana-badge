@@ -6,7 +6,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 dir=${1:-$here/../solana-os}
-COMMIT=edad4d91afeb8c8523c40ae4f49c5d0c879a8b9f
+COMMIT=64a474b698008dfff09d321dd1a8584ba96ccb5f
 # Upstream files changed, plus new files that live among upstream's own.
 NEW="components/bsp/Kconfig components/bsp/bsp_sd_flash.c components/bsp/bsp_touch.c
      main/core/os_touch.c main/core/os_touch.h main/core/touchcal.c

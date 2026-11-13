@@ -9,7 +9,7 @@ set -e
 here=$(cd "$(dirname "$0")" && pwd)
 dir=${1:-$here/../solana-os}
 UPSTREAM=https://github.com/solana-foundation/solana-os.git
-COMMIT=edad4d91afeb8c8523c40ae4f49c5d0c879a8b9f
+COMMIT=64a474b698008dfff09d321dd1a8584ba96ccb5f
 
 [ -d "$dir/.git" ] || git clone "$UPSTREAM" "$dir"
 if [ "$(git -C "$dir" rev-parse HEAD)" != "$COMMIT" ]; then

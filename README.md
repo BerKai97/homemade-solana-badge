@@ -1,6 +1,6 @@
 # homemade-solana-badge
 
-Launch a pump.fun coin from a homemade Solana Breakpoint 2026 badge (ESP32-C5, Solana OS 1.0.0).
+Launch a pump.fun coin from a homemade Solana Breakpoint 2026 badge (ESP32-C5, Solana OS 2.1.0).
 
 - `apps/pump/`: the Pump Launch app (Lua). Pick a picture, set the name, ticker and description,
   launch: the picture and metadata go to IPFS (Filebase), then a standard `create_v2` (SOL pair,
@@ -29,23 +29,25 @@ cd ../solana-os && idf.py build flash monitor        # ESP-IDF 6.0.1
 
 `./save.sh` copies firmware work done in that checkout back here.
 
-An app's Lua compiled on the badge keeps ~70 bytes of heap per line, more than Pump Launch can spare.
-So `badge_put.py` compiles it on the PC the way the App Store does (`code.bin`, run in place from
+Solana OS gives an app 6 MB of heap in PSRAM, or 96 KB on a chip without it. An app's Lua compiled
+on the badge keeps ~70 bytes of heap per line, more than Pump Launch can spare in 96 KB. So
+`badge_put.py` compiles it on the PC the way the App Store does (`code.bin`, run in place from
 flash), and the patch lets the console write `code.bin`; the badge runs it only when `app.json`
-names its SHA-256. Pump Launch then idles at ~38 KB and peaks at ~50 KB while launching, of the 96 KB
-Solana OS gives an app. It needs node and the firmware's compiler, built once:
+names its SHA-256. It needs node and the firmware's compiler, built once:
 
 ```sh
 cd ../solana-os && podman run --rm -v "$PWD":/src:Z -w /src docker.io/emscripten/emsdk:4.0.10 \
     tools/luac/build.sh tools/luac/out/luac.mjs
 ```
 
-Without it `badge_put.py` warns and sends the source only, and launching runs out of memory.
+Without it `badge_put.py` warns and sends the source only; without PSRAM, launching then runs out of
+memory.
 
 ### Breadboard build
 
-The homemade badge: an ESP32-C5 dev board and a 2.8" ILI9341 display with XPT2046 touch, no SD
-card, buttons or battery.
+The homemade badge: an ESP32-C5 dev board with PSRAM (N16R8: 16 MB flash, 8 MB PSRAM) and a 2.8"
+ILI9341 display with XPT2046 touch, no SD card, buttons or battery. The display runs at 20 MHz, half
+the real badge's clock, for the jumper wires; colour inversion is off (Settings > Invert colours).
 
 ```sh
 idf.py -B build-diy -D SDKCONFIG=build-diy/sdkconfig \

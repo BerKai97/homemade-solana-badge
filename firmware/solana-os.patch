@@ -159,10 +159,10 @@ index 7f92e43..6e73601 100644
  {
      return s_pressed;
 diff --git a/components/bsp/bsp_display.c b/components/bsp/bsp_display.c
-index 326b83c..f2c6648 100644
+index 70cc560..a196cf4 100644
 --- a/components/bsp/bsp_display.c
 +++ b/components/bsp/bsp_display.c
-@@ -52,7 +52,7 @@ static bool flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data
+@@ -95,7 +95,7 @@ static bool flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data
  #define BL_TIMER    LEDC_TIMER_0
  #define BL_CHANNEL  LEDC_CHANNEL_0
  #define BL_BITS     LEDC_TIMER_10_BIT
@@ -171,7 +171,7 @@ index 326b83c..f2c6648 100644
  
  static uint8_t s_bl_pct = 100;  // the level "on" means
  static bool s_bl_on;
-@@ -106,6 +106,13 @@ uint8_t bsp_backlight_get_level(void)
+@@ -149,6 +149,13 @@ uint8_t bsp_backlight_get_level(void)
      return s_bl_pct;
  }
  
@@ -185,6 +185,17 @@ index 326b83c..f2c6648 100644
  lv_display_t *bsp_display_start(void)
  {
      bl_init();
+@@ -177,8 +184,8 @@ lv_display_t *bsp_display_start(void)
+     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
+     // Production panels need inversion; without it RED reads on cyan and GREEN on
+     // magenta. The prototypes' panels are the other way round (bsp.h).
+-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
+-    s_inverted = true;
++    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, BOARD_LCD_INVERT));
++    s_inverted = BOARD_LCD_INVERT;
+     s_panel = panel;
+     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+ 
 diff --git a/components/bsp/bsp_sd.c b/components/bsp/bsp_sd.c
 index 28e1b22..eefd317 100644
 --- a/components/bsp/bsp_sd.c
@@ -268,7 +279,7 @@ index 28e1b22..eefd317 100644
  const char *bsp_sd_state_str(bsp_sd_state_t s)
  {
 diff --git a/components/bsp/include/board.h b/components/bsp/include/board.h
-index 0b6d98e..3c4e55c 100644
+index 415798c..93312ad 100644
 --- a/components/bsp/include/board.h
 +++ b/components/bsp/include/board.h
 @@ -4,9 +4,16 @@
@@ -300,8 +311,22 @@ index 0b6d98e..3c4e55c 100644
  #define BOARD_LCD_DC            7
  #define BOARD_LCD_RST           0       // as used by stock firmware
  #define BOARD_LCD_BL            3       // active high, external pull-down
-@@ -24,8 +35,33 @@
- #define BOARD_LCD_PCLK_HZ       (20 * 1000 * 1000)
+@@ -23,12 +34,46 @@
+ #define BOARD_LCD_V_RES         240
+ // 40 MHz: a full frame is 31 ms on the wire (61 ms at 20 MHz, the reference's
+ // clock), so the app area redraws at 25 fps instead of 15 (measured). The
+-// card keeps its own 20 MHz on the same bus.
++// card keeps its own 20 MHz on the same bus. The breadboard stays at 20: its
++// bus runs over jumper wires and carries the touch panel too.
++// BOARD_LCD_INVERT: colour inversion at boot and while Settings has none saved
++// (bsp.h). Production panels need it; the breadboard's shows true colours without.
++#if CONFIG_BSP_BOARD_DIY
++#define BOARD_LCD_PCLK_HZ       (20 * 1000 * 1000)
++#define BOARD_LCD_INVERT        0
++#else
+ #define BOARD_LCD_PCLK_HZ       (40 * 1000 * 1000)
++#define BOARD_LCD_INVERT        1
++#endif
  
  // microSD (SPI mode, no card-detect or write-protect lines)
 +#if CONFIG_BSP_SD_INTERNAL_FLASH
@@ -334,7 +359,7 @@ index 0b6d98e..3c4e55c 100644
  // I2C: TCA9534 I/O expander, P0..P5 = PB1..PB6 (active low), P6/P7 unconnected
  #define BOARD_I2C_PORT          I2C_NUM_0
  #define BOARD_I2C_SCL           23
-@@ -33,6 +69,7 @@
+@@ -36,6 +81,7 @@
  #define BOARD_TCA9534_ADDR      0x20
  #define BOARD_TCA9534_INT       25      // open-drain, active low
  #define BOARD_BTN_COUNT         6
@@ -342,7 +367,7 @@ index 0b6d98e..3c4e55c 100644
  
  // BOOT button (strapping pin, external pull-up, active low)
  #define BOARD_BOOT_BTN          28
-@@ -41,9 +78,14 @@
+@@ -44,9 +90,14 @@
  #define BOARD_RGB_GPIO          27
  #define BOARD_RGB_COUNT         8
  
@@ -359,10 +384,19 @@ index 0b6d98e..3c4e55c 100644
  // UART0 console via CH340C
  #define BOARD_UART_TX           11
 diff --git a/components/bsp/include/bsp.h b/components/bsp/include/bsp.h
-index f503531..066a89f 100644
+index 8e6c307..89a6317 100644
 --- a/components/bsp/include/bsp.h
 +++ b/components/bsp/include/bsp.h
-@@ -54,6 +54,19 @@ typedef void (*bsp_btn_cb_t)(uint32_t pressed, uint32_t changed);
+@@ -47,7 +47,7 @@ void bsp_backlight(bool on);
+ void bsp_backlight_level(uint8_t pct);
+ uint8_t bsp_backlight_get_level(void);
+ // Colour inversion. Production panels need it (on, what bsp_display_start()
+-// sets); the prototypes' panels (rev 1.2 C5 modules, like HYQ5VS) show RED on
++// sets: BOARD_LCD_INVERT, off on the breadboard); the prototypes' panels (rev 1.2 C5 modules, like HYQ5VS) show RED on
+ // cyan with it, and nothing on the bus tells the two apart: same ILI9341, same
+ // registers. The OS applies the user's setting (Settings > Invert colours).
+ // Any task but the LVGL task's flush path.
+@@ -61,6 +61,19 @@ typedef void (*bsp_btn_cb_t)(uint32_t pressed, uint32_t changed);
  esp_err_t bsp_buttons_start(bsp_btn_cb_t cb);
  uint32_t bsp_buttons_get(void);
  
@@ -383,7 +417,7 @@ index f503531..066a89f 100644
  esp_err_t bsp_rgb_init(void);
  void bsp_rgb_set(int index, uint8_t r, uint8_t g, uint8_t b);
 diff --git a/docs/LUA_API.md b/docs/LUA_API.md
-index fdab64d..8ab4c10 100644
+index 70dbb20..b1564af 100644
 --- a/docs/LUA_API.md
 +++ b/docs/LUA_API.md
 @@ -73,9 +73,11 @@ The manifest, as the badge stores it:
@@ -417,7 +451,7 @@ index fdab64d..8ab4c10 100644
  ```
  
  Up, down, left, right and CANCEL auto-repeat while held (`rep` true: after 400 ms, then
-@@ -232,6 +239,7 @@ bundled with the app, play animated GIFs, write pixel art in Lua, or draw on a c
+@@ -233,6 +240,7 @@ bundled with the app, play animated GIFs, write pixel art in Lua, or draw on a c
  
  ```lua
  local logo = ui.image(10, 10, "art/logo.png")         -- a bundled PNG, shown as it is
@@ -425,7 +459,7 @@ index fdab64d..8ab4c10 100644
  local hero = ui.image(100, 60, {                      -- pixel art: one character per pixel
    "..pp..",
    ".pggp.",
-@@ -266,6 +274,9 @@ dance:scale(3)  dance:pos(x, y)  dance:show(b)  dance:remove()
+@@ -267,6 +275,9 @@ dance:scale(3)  dance:pos(x, y)  dance:show(b)  dance:remove()
    gives its first frame), or a table of rows. A path is read and decoded each time it's given, so load what you draw
    often with `ui.load` once. The `{palette = ...}` option, after the position, goes
    with rows.
@@ -435,7 +469,7 @@ index fdab64d..8ab4c10 100644
  - **Pixel art.** Each character is a pixel: `.` and space are see-through, `#` is the
    theme's text colour, and `k` black, `w` white, `p` purple, `g` green, `m` pink,
    `v` light purple, `b` blue, `a` aqua, `l` lime, `y` yellow, `o` orange are the
-@@ -1732,6 +1743,72 @@ Bun.serve({
+@@ -1912,6 +1923,73 @@ Bun.serve({
    `solana:<recipient>?amount=0.01&reference=<address>&label=Badge`, has the wallet
    build the transfer itself. Watch for the reference in the same way.
  
@@ -455,7 +489,8 @@ index fdab64d..8ab4c10 100644
 +
 +`sol` needs no permission. Addresses are base58 strings; seeds, instruction data and
 +messages are binary strings (`string.pack` builds them). Numbers past 2^31 are decimal
-+strings.
++strings. `crypto` and `solana` work alongside it on raw bytes; `sol` adds what signing
++needs.
 +
 +```lua
 +sol.encode(bytes)                 -- base58, up to 64 bytes
@@ -508,7 +543,7 @@ index fdab64d..8ab4c10 100644
  ## Example
  
  ```lua
-@@ -1870,6 +1947,6 @@ bundled path like `lib/quiz.lua`:
+@@ -2050,6 +2128,6 @@ bundled path like `lib/quiz.lua`:
    there. Run on badge works this way.
  
  These refuse while the app runs (`open home` closes it) and check `app.json` like an
@@ -832,10 +867,10 @@ index 82deb56..91b18fc 100644
          s_pkgs = in;
          s_n = n;
 diff --git a/main/apps/debug/debug_app.c b/main/apps/debug/debug_app.c
-index 0b59417..41aa546 100644
+index ebcbd77..918cd1c 100644
 --- a/main/apps/debug/debug_app.c
 +++ b/main/apps/debug/debug_app.c
-@@ -300,7 +300,11 @@ static void sd_render_info(void)
+@@ -301,7 +301,11 @@ static void sd_render_info(void)
  static void build_sd(lv_obj_t *p)
  {
      lv_obj_t *box = ui_panel(p, 4, 4, OS_ROOT_W - 8, 66);
@@ -847,8 +882,18 @@ index 0b59417..41aa546 100644
      lv_obj_set_pos(t, 0, -2);
      s_sd_status = ui_label(box, &sol_font_14, COL_TEXT, "");
      lv_obj_align(s_sd_status, LV_ALIGN_TOP_RIGHT, 0, -4);
+@@ -469,7 +473,8 @@ static void build_display(lv_obj_t *p)
+         lv_obj_set_style_bg_color(g, lv_color_make(v, v, v), 0);
+     }
+     lv_obj_t *info = ui_label(p, &sol_mono_12, COL_DIM, "");
+-    lv_label_set_text_fmt(info, "ILI9341 320x240  SPI2 @%d MHz  CS=6 DC=7 BL=3", BOARD_LCD_PCLK_HZ / 1000000);
++    lv_label_set_text_fmt(info, "ILI9341 320x240  SPI2 @%d MHz  CS=%d DC=7 BL=3", BOARD_LCD_PCLK_HZ / 1000000,
++                          BOARD_LCD_CS);
+     lv_obj_set_pos(info, 8, 122);
+     s_led_label = ui_label(p, &sol_font_14, COL_TEXT, "");
+     lv_obj_set_pos(s_led_label, 8, 142);
 diff --git a/main/core/console.c b/main/core/console.c
-index 10abf9a..02436c9 100644
+index 65ec2d0..13461cc 100644
 --- a/main/core/console.c
 +++ b/main/core/console.c
 @@ -12,6 +12,10 @@
@@ -862,7 +907,7 @@ index 10abf9a..02436c9 100644
  #include "esp_timer.h"
  #include "esp_heap_caps.h"
  #include "esp_log.h"
-@@ -31,11 +35,12 @@ static int cmd_heap(int argc, char **argv);
+@@ -32,11 +36,12 @@ static int cmd_heap(int argc, char **argv);
  
  static int cmd_info(int argc, char **argv)
  {
@@ -877,7 +922,7 @@ index 10abf9a..02436c9 100644
             BOARD_SD_CS, BOARD_I2C_SCL, BOARD_I2C_SDA, BOARD_TCA9534_ADDR, BOARD_TCA9534_INT, BOARD_BOOT_BTN,
             BOARD_RGB_COUNT, BOARD_RGB_GPIO, BOARD_BAT_ADC_GPIO, BOARD_BAT_DIVIDER, BOARD_UART_TX, BOARD_UART_RX);
      int mv = bsp_battery_mv();
-@@ -322,6 +327,56 @@ static int cmd_reboot(int argc, char **argv)
+@@ -342,6 +347,56 @@ static int cmd_reboot(int argc, char **argv)
      return 0;
  }
  
@@ -934,7 +979,7 @@ index 10abf9a..02436c9 100644
  // The REPL waits in our command meanwhile, so the UART is ours: read its
  // driver directly (the REPL installed it). stdin's VFS would add nothing, and
  // in the console's CR mode it holds no byte back.
-@@ -330,6 +385,11 @@ int console_stream_read(void *buf, size_t n, int timeout_ms)
+@@ -350,6 +405,11 @@ int console_stream_read(void *buf, size_t n, int timeout_ms)
      if (!n) {
          return 0;                           // asking whether this console streams: it does
      }
@@ -946,7 +991,7 @@ index 10abf9a..02436c9 100644
      int got = uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buf, n, pdMS_TO_TICKS(timeout_ms));
      return got < 0 ? -1 : got;
  }
-@@ -372,6 +432,9 @@ static void start_now(void)
+@@ -392,6 +452,9 @@ static void start_now(void)
      }
      esp_console_register_help_command();
      ESP_ERROR_CHECK(esp_console_start_repl(repl));
@@ -1018,7 +1063,7 @@ index b7eec7c..2f19d06 100644
      s_dots = lv_obj_create(root);
      lv_obj_remove_style_all(s_dots);
 diff --git a/main/core/os.c b/main/core/os.c
-index aacf79d..df1e97a 100644
+index 4f137f6..a46af7a 100644
 --- a/main/core/os.c
 +++ b/main/core/os.c
 @@ -19,6 +19,9 @@
@@ -1249,7 +1294,7 @@ index aacf79d..df1e97a 100644
          if (held != OS_KEY_NONE && now >= next_repeat) {
              uint32_t pressed = bsp_buttons_get();
              if (pressed & held_bit) {
-@@ -779,6 +942,9 @@ void os_start(void)
+@@ -785,6 +948,9 @@ void os_start(void)
      if (bsp_buttons_start(on_buttons) != ESP_OK) {
          ESP_LOGE(TAG, "buttons unavailable; use the console 'key' command");
      }
@@ -1496,10 +1541,10 @@ index c444d6a..7c839c8 100644
          uok = *p > 0x20 && *p < 0x7F;   // shown on screen and sent back in a URL
      }
 diff --git a/main/core/os_http.c b/main/core/os_http.c
-index 4bfa114..8998807 100644
+index 379e6c9..a8c918f 100644
 --- a/main/core/os_http.c
 +++ b/main/core/os_http.c
-@@ -16,6 +16,7 @@
+@@ -20,6 +20,7 @@
  #include <string.h>
  #include <strings.h>
  #include <stdlib.h>
@@ -1507,7 +1552,7 @@ index 4bfa114..8998807 100644
  #include "freertos/FreeRTOS.h"
  #include "freertos/semphr.h"
  #include "esp_http_client.h"
-@@ -55,6 +56,16 @@ static bool s_ticket;                   // a TLS connection to s_origin succeede
+@@ -74,6 +75,16 @@ static bool s_ticket;                   // a TLS connection to s_origin succeede
  static int64_t s_last_ms;
  static header_ctx_t s_hdr;              // what the event handler captures for this request
  static volatile size_t s_dl_done, s_dl_total;   // os_http_progress()
@@ -1524,7 +1569,7 @@ index 4bfa114..8998807 100644
  static struct {
      uint32_t requests, connects;
  } s_n;
-@@ -154,16 +165,58 @@ static esp_err_t prepare(const char *url)
+@@ -173,16 +184,58 @@ static esp_err_t prepare(const char *url)
  
  // Send one request on the current connection (opening it if needed) and read
  // the status and headers.
@@ -1585,7 +1630,7 @@ index 4bfa114..8998807 100644
          snprintf(auth, sizeof(auth), "Bearer %s", bearer);
          esp_http_client_set_header(s_client, "Authorization", auth);   // copies it
          // Not left on the stack: a panic's stack dump would print the badge secret.
-@@ -172,17 +225,13 @@ static esp_err_t send_request(const char *method, const char *bearer, const char
+@@ -191,17 +244,13 @@ static esp_err_t send_request(const char *method, const char *bearer, const char
      } else {
          esp_http_client_delete_header(s_client, "Authorization");
      }
@@ -1606,7 +1651,7 @@ index 4bfa114..8998807 100644
      }
      if (err == ESP_OK) {
          int64_t r = esp_http_client_fetch_headers(s_client);
-@@ -242,13 +291,14 @@ static void lock(void)
+@@ -261,13 +310,14 @@ static void lock(void)
      xSemaphoreTake(s_lock, portMAX_DELAY);
  }
  
@@ -1620,10 +1665,10 @@ index 4bfa114..8998807 100644
      }
      lock();
 +    s_up = up;
-     size_t free0 = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+     size_t free0 = heap_caps_get_free_size(os_mem_tls_caps());
      heap_caps_monitor_local_minimum_free_size_start();
      bool fresh = !s_open;
-@@ -278,10 +328,45 @@ esp_err_t os_http_request(const char *method, const char *url, const char *beare
+@@ -297,10 +347,45 @@ esp_err_t os_http_request(const char *method, const char *url, const char *beare
                   (unsigned)low, (unsigned)(free0 - low));
      }
      ESP_LOGD(TAG, "%s %s -> %d (%u B, %s)", method, url, *status, (unsigned)got, fresh ? "new connection" : "reused");
@@ -1688,6 +1733,40 @@ index b62e976..6148014 100644
  // GET url and stream a 2xx body into the file at path (created or truncated),
  // at most max bytes: a longer body fails with ESP_ERR_INVALID_SIZE (the file
  // is then incomplete; the caller removes it). Other statuses leave the file
+diff --git a/main/core/os_settings.c b/main/core/os_settings.c
+index a7a596d..c458586 100644
+--- a/main/core/os_settings.c
++++ b/main/core/os_settings.c
+@@ -5,6 +5,7 @@
+ #include <stdint.h>
+ #include "esp_log.h"
+ #include "nvs.h"
++#include "board.h"
+ #include "os_settings.h"
+ 
+ static const char *TAG = "settings";
+@@ -16,7 +17,7 @@ static const struct {
+     [OS_SET_THEME] = {"theme", OS_THEME_DARK},
+     [OS_SET_BRIGHTNESS] = {"bright", OS_BRIGHTNESS_MAX},
+     // The key 0.4.1-0.4.2 used, with the same meaning: what a badge saved then holds.
+-    [OS_SET_LCD_INVERT] = {"lcd_invert", 1},
++    [OS_SET_LCD_INVERT] = {"lcd_invert", BOARD_LCD_INVERT},
+ };
+ 
+ static int32_t s_val[OS_SET_COUNT];
+diff --git a/main/core/os_settings.h b/main/core/os_settings.h
+index f8ff265..1c0de3c 100644
+--- a/main/core/os_settings.h
++++ b/main/core/os_settings.h
+@@ -7,7 +7,7 @@
+ typedef enum {
+     OS_SET_THEME,           // OS_THEME_DARK (default) or OS_THEME_LIGHT; see ui_col()
+     OS_SET_BRIGHTNESS,      // screen backlight level 1..OS_BRIGHTNESS_MAX (default: brightest); see os_brightness_apply()
+-    OS_SET_LCD_INVERT,      // 1 (default: production panels) or 0 (prototypes): colour inversion; see os_invert_apply()
++    OS_SET_LCD_INVERT,      // 1 (production panels) or 0 (prototypes); default BOARD_LCD_INVERT; see os_invert_apply()
+     OS_SET_COUNT,
+ } os_setting_t;
+ 
 diff --git a/main/core/ui.c b/main/core/ui.c
 index 8c5d713..3de8b99 100644
 --- a/main/core/ui.c
@@ -2004,7 +2083,7 @@ index 4a0bff4..f713c3a 100644
  // ---- Amounts, categories, rarities (docs/HHGTS.md "One look") ----
  // Same names and colours as the web. Amounts use sol_mono_12 or the
 diff --git a/main/lua/lua_cmd.c b/main/lua/lua_cmd.c
-index f303cb4..040cf48 100644
+index 3447bee..ba2f5e2 100644
 --- a/main/lua/lua_cmd.c
 +++ b/main/lua/lua_cmd.c
 @@ -5,10 +5,13 @@
@@ -2087,10 +2166,10 @@ index f303cb4..040cf48 100644
      n += sum_dir(id, 1);
      printf("sums: %d files\n", n);
 diff --git a/main/lua/lua_host.c b/main/lua/lua_host.c
-index 8e4bcdd..46dad04 100644
+index f92b3ea..a4fe2fc 100644
 --- a/main/lua/lua_host.c
 +++ b/main/lua/lua_host.c
-@@ -473,27 +473,56 @@ static int run_main(lua_State *L)
+@@ -493,27 +493,56 @@ static int run_main(lua_State *L)
  
  static const char *const s_key_names[] = {"up", "down", "left", "right", "select", "back"};
  
@@ -2154,10 +2233,10 @@ index 8e4bcdd..46dad04 100644
  static int tick_cb(lua_State *L)
  {
      lua_getglobal(L, "on_tick");
-@@ -529,6 +558,11 @@ static void run_events(lh_t *s, const lh_ev_t *ev)
+@@ -549,6 +578,11 @@ static void run_events(lh_t *s, const lh_ev_t *ev)
          } else if (ev->kind == LH_EV_MEET) {
              lh_meet_event(s, ev->data);
-         }
+         }                                   // LH_EV_SCAN only wakes us: lh_mesh_scan_run below
 +#if CONFIG_OS_TOUCH
 +        else if (ev->kind == LH_EV_TOUCH) {
 +            lh_callback(s, touch_cb, (void *)ev);
@@ -2166,7 +2245,7 @@ index 8e4bcdd..46dad04 100644
      }
      lh_calls_run(s);
      lh_ws_run(s);
-@@ -717,6 +751,23 @@ static void lua_task(void *arg)
+@@ -738,6 +772,23 @@ static void lua_task(void *arg)
  // ---------------------------------------------------------------------------
  // The host app (OS task)
  
@@ -2190,7 +2269,7 @@ index 8e4bcdd..46dad04 100644
  static void host_enter(lv_obj_t *root)
  {
      xSemaphoreTake(lh_mx, portMAX_DELAY);
-@@ -731,6 +782,9 @@ static void host_enter(lv_obj_t *root)
+@@ -752,6 +803,9 @@ static void host_enter(lv_obj_t *root)
      lv_obj_set_style_bg_opa(area, LV_OPA_COVER, 0);
      lv_obj_set_style_bg_color(area, ui_col(COL_BG), 0);
      lv_obj_set_scrollable(area, false);
@@ -2201,7 +2280,7 @@ index 8e4bcdd..46dad04 100644
      lh_t *s = pkg.id[0] && !busy ? calloc(1, sizeof(*s)) : NULL;
      if (!s) {
 diff --git a/main/lua/lua_img.c b/main/lua/lua_img.c
-index 9c81dc9..df811d9 100644
+index 2006acd..46f32ea 100644
 --- a/main/lua/lua_img.c
 +++ b/main/lua/lua_img.c
 @@ -276,13 +276,39 @@ static lh_pix_t *load_gif(lua_State *L, lh_t *s, const char *rel, long size, con
@@ -2255,7 +2334,7 @@ index 9c81dc9..df811d9 100644
      }
      luaL_typeerror(L, idx, "image, PNG or GIF path, or table of rows");
 diff --git a/main/lua/lua_net.c b/main/lua/lua_net.c
-index b5037c6..cade12e 100644
+index 33923ff..59e5b3d 100644
 --- a/main/lua/lua_net.c
 +++ b/main/lua/lua_net.c
 @@ -11,15 +11,25 @@
@@ -2525,7 +2604,7 @@ index b5037c6..cade12e 100644
  }
  
  void lh_calls_free(lh_t *s)
-@@ -1042,8 +1217,133 @@ static int l_mesh_bridge(lua_State *L)
+@@ -1267,8 +1442,133 @@ static int l_mesh_bridge(lua_State *L)
      return 0;
  }
  
@@ -2806,19 +2885,19 @@ index 863e382..12a5053 100644
  // fit, so it can't add lines or restructure the question.
  void lua_pkg_plain(char *out, size_t n, const char *in);
 diff --git a/main/lua/lua_priv.h b/main/lua/lua_priv.h
-index f70dba4..98c4c03 100644
+index 6937ae2..339574d 100644
 --- a/main/lua/lua_priv.h
 +++ b/main/lua/lua_priv.h
-@@ -235,7 +235,7 @@ typedef struct {
+@@ -252,7 +252,7 @@ typedef struct {
  extern lh_stats_t lh_stats;
  
  // Events for the Lua task.
--typedef enum { LH_EV_KEY, LH_EV_WAKE, LH_EV_MESH, LH_EV_MEET, LH_EV_QUIT } lh_ev_kind_t;
-+typedef enum { LH_EV_KEY, LH_EV_WAKE, LH_EV_MESH, LH_EV_MEET, LH_EV_QUIT, LH_EV_TOUCH } lh_ev_kind_t;
+-typedef enum { LH_EV_KEY, LH_EV_WAKE, LH_EV_MESH, LH_EV_MEET, LH_EV_SCAN, LH_EV_QUIT } lh_ev_kind_t;
++typedef enum { LH_EV_KEY, LH_EV_WAKE, LH_EV_MESH, LH_EV_MEET, LH_EV_SCAN, LH_EV_QUIT, LH_EV_TOUCH } lh_ev_kind_t;
  
  typedef struct {
      uint8_t kind;
-@@ -243,6 +243,9 @@ typedef struct {
+@@ -260,6 +260,9 @@ typedef struct {
      bool repeat;
      uint32_t gen;
      char *data;                 // LH_EV_MESH, LH_EV_MEET: "<from id>\0<json>", freed by the receiver
@@ -2828,9 +2907,9 @@ index f70dba4..98c4c03 100644
  } lh_ev_t;
  
  extern SemaphoreHandle_t lh_mx;     // guards call records, the mesh filter, lh_cur
-@@ -340,6 +343,11 @@ void lh_ble_init(lh_t *s);                              // at launch: no refs ye
- void lh_ble_run(lh_t *s);                               // Lua task: owed callbacks and os_ble's events
- void lh_ble_stop(lh_t *s);                              // any task: the app stops, Bluetooth goes off
+@@ -363,6 +366,11 @@ void lh_ble_stop(lh_t *s);                              // any task: the app sto
+ // lua_crypto.c: crypto (SHA-256, Ed25519 checks) and solana (base58, program-derived addresses)
+ void lh_open_crypto(lua_State *L);
  
 +// lua_sol.c: sol, wallet, chain. lh_open_net opens them with its own
 +// wallet.sign and chain.rpc, which use the call records.
@@ -2841,10 +2920,10 @@ index f70dba4..98c4c03 100644
  void lh_open_net(lua_State *L);
  void lh_calls_run(lh_t *s);                             // answer finished calls
 diff --git a/main/lua/lua_ui.c b/main/lua/lua_ui.c
-index e8a2b8b..ee2df13 100644
+index fd67fe0..4377b62 100644
 --- a/main/lua/lua_ui.c
 +++ b/main/lua/lua_ui.c
-@@ -716,8 +716,19 @@ static int l_confirm(lua_State *L)
+@@ -771,8 +771,19 @@ static int l_confirm(lua_State *L)
      lv_obj_set_style_border_color(p, ui_col(COL_PURPLE), 0);
      lv_obj_t *t = ui_label(p, &sol_font_14, COL_TEXT, text);
      lv_obj_set_width(t, OS_ROOT_W - 66);
@@ -2865,18 +2944,18 @@ index e8a2b8b..ee2df13 100644
      s->modal = dim;
      return 0;
 diff --git a/main/sources.cmake b/main/sources.cmake
-index d5c6dbc..27a2bfd 100644
+index 633b67e..47dc783 100644
 --- a/main/sources.cmake
 +++ b/main/sources.cmake
-@@ -31,6 +31,7 @@ set(SOLANA_OS_SRCS
+@@ -32,6 +32,7 @@ set(SOLANA_OS_SRCS
      lua/lua_host.c lua/lua_ui.c lua/lua_sys.c lua/lua_net.c lua/lua_json.c lua/lua_pkg.c lua/lua_cmd.c
      lua/lua_fs.c lua/lua_install.c lua/lua_code.c lua/lua_ws.c lua/lua_img.c lua/lua_png.c lua/lua_gif.c lua/lua_meet.c
-     lua/lua_ble.c
+     lua/lua_ble.c lua/lua_crypto.c
 +    lua/lua_sol.c sol/sol.c sol/vendor/tweetnacl.c wallet/wallet.c kb/kb_cmd.c img/thumb.c img/vendor/miniz_tinfl.c img/vendor/tjpgd.c
      ${SOLANA_OS_LUA_VENDOR_SRCS}
      assets/sol_mono_12.c assets/sol_font_14.c assets/sol_font_20.c assets/sol_font_32.c
      assets/img_logomark_16.c assets/img_logomark_40.c assets/img_logomark_72.c
-@@ -48,3 +49,8 @@ set(SOLANA_OS_DEVICE_SRCS
+@@ -49,3 +50,8 @@ set(SOLANA_OS_DEVICE_SRCS
      core/console.c
      lua/lua_xip.c
  )
@@ -4018,10 +4097,10 @@ index 0000000..9c749ce
 +appfs,      data, fat,      0xA20000, 0x5E0000
 diff --git a/sdkconfig.diy b/sdkconfig.diy
 new file mode 100644
-index 0000000..3a7e016
+index 0000000..acae298
 --- /dev/null
 +++ b/sdkconfig.diy
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,13 @@
 +# The breadboard build (components/bsp/Kconfig, BSP_BOARD_DIY), on top of sdkconfig.defaults:
 +#   idf.py -B build-diy -D SDKCONFIG=build-diy/sdkconfig \
 +#          -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diy" build flash monitor
@@ -4034,16 +4113,4 @@ index 0000000..3a7e016
 +# XPT2046 touch on the display: T_CS on GPIO6, T_IRQ not wired (polled); see BSP_TOUCH_* in components/bsp/Kconfig.
 +CONFIG_BSP_TOUCH_XPT2046=y
 +CONFIG_BSP_TOUCH_IRQ=-1
-+# The ESP32-C5-WROOM-1 N16R8 has 8 MB of quad PSRAM: malloc() uses it for big
-+# blocks, and mbedTLS takes all its buffers from it, so a TLS handshake no
-+# longer needs ~35 KB of internal RAM. A module without PSRAM still boots.
-+CONFIG_SPIRAM=y
-+CONFIG_SPIRAM_MODE_QUAD=y
-+CONFIG_SPIRAM_SPEED_80M=y
-+CONFIG_SPIRAM_USE_MALLOC=y
-+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
-+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
-+# ESP-IDF's flash driver, not the ROM's (sdkconfig.defaults): after a write the C5 ROM
-+# invalidates every cache page whose MMU entry has the same page number, PSRAM's too, so
-+# an NVS write (flash pages 0-1) threw away cached PSRAM pages 0-1, the start of the heap.
-+CONFIG_SPI_FLASH_ROM_IMPL=n
++# PSRAM as on the badge (sdkconfig.defaults): the ESP32-C5 N16R8 has 8 MB of quad PSRAM too.
